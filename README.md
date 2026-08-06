@@ -4,6 +4,12 @@ NiceGrab is a tiny native macOS menu-bar app for turning ordinary window screens
 
 Press a global keyboard shortcut and NiceGrab captures the frontmost window, centers it on your chosen background, adds optional template text, and puts the finished image directly on the clipboard.
 
+## Download
+
+[Download NiceGrab from the Mac App Store](https://apps.apple.com/app/id6798733469) — no Xcode required.
+
+The App Store link will become available as soon as Apple publishes the app.
+
 ![A browser window captured by NiceGrab and centered over an illustrated landscape](docs/images/nicegrab-example.png)
 
 ## What it does
