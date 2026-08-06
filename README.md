@@ -81,6 +81,8 @@ Preferences such as the background, canvas format, padding, template text, and k
 
 NiceGrab works locally on your Mac. Screenshots and background images are composited in memory and written to the system clipboard; they are not uploaded anywhere.
 
+Read the full [NiceGrab Privacy Policy](PRIVACY.md).
+
 ## Project structure
 
 - `Sources/FrameGrab` — AppKit menu-bar app and screenshot compositor
