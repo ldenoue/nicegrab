@@ -4,10 +4,16 @@ import Carbon
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var hotKey: EventHotKeyRef?
+    private var recordingHotKey: EventHotKeyRef?
     private var hotKeyHandler: EventHandlerRef?
+    private var videoRecorder: AnyObject?
     private let composer = ScreenshotComposer()
     private let backgroundStore = BackgroundStore()
     private let shortcutSettings = ShortcutSettings()
+    private var includeMicrophone: Bool {
+        get { UserDefaults.standard.bool(forKey: "recording.includeMicrophone") }
+        set { UserDefaults.standard.set(newValue, forKey: "recording.includeMicrophone") }
+    }
     private lazy var captureSound: NSSound? = {
         let systemSound = URL(fileURLWithPath: "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Screen Capture.aif")
         return NSSound(contentsOf: systemSound, byReference: true) ?? NSSound(named: NSSound.Name("Tink"))
@@ -17,10 +23,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         makeStatusItem()
         installHotKeyHandler()
         _ = registerHotKey(shortcutSettings.shortcut)
+        _ = registerRecordingHotKey(shortcutSettings.recordingShortcut)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         if let hotKey { UnregisterEventHotKey(hotKey) }
+        if let recordingHotKey { UnregisterEventHotKey(recordingHotKey) }
         if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
     }
 
@@ -38,6 +46,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let shortcut = NSMenuItem(title: "Keyboard Shortcut: \(shortcutSettings.shortcut.displayName)…", action: #selector(changeKeyboardShortcut), keyEquivalent: "")
         shortcut.target = self
         menu.addItem(shortcut)
+
+        let recording = NSMenuItem(
+            title: isRecording ? "Stop Window Recording" : "Record Front Window",
+            action: #selector(toggleWindowRecording),
+            keyEquivalent: ""
+        )
+        recording.target = self
+        menu.addItem(recording)
+        let recordingShortcut = NSMenuItem(title: "Recording Shortcut: \(shortcutSettings.recordingShortcut.displayName)…", action: #selector(changeRecordingShortcut), keyEquivalent: "")
+        recordingShortcut.target = self
+        recordingShortcut.isEnabled = !isRecording
+        menu.addItem(recordingShortcut)
+        let microphone = NSMenuItem(title: "Include Microphone", action: #selector(toggleMicrophone), keyEquivalent: "")
+        microphone.target = self
+        microphone.state = includeMicrophone ? .on : .off
+        microphone.isEnabled = !isRecording
+        menu.addItem(microphone)
         menu.addItem(.separator())
 
         let backgroundTitle = backgroundStore.displayName.map { "Background: \($0)" } ?? "Background: Default Gradient"
@@ -124,6 +149,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if identifier.id == 1 {
                 let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
                 DispatchQueue.main.async { delegate.captureFrontWindow() }
+            } else if identifier.id == 2 {
+                let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+                DispatchQueue.main.async { delegate.toggleWindowRecording() }
             }
             return noErr
         }, 1, &eventType, Unmanaged.passUnretained(self).toOpaque(), &hotKeyHandler)
@@ -136,6 +164,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotKey = nil
         let identifier = EventHotKeyID(signature: OSType(0x4E475242), id: 1) // NGRB
         return RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, identifier, GetApplicationEventTarget(), 0, &hotKey) == noErr
+    }
+
+    @discardableResult
+    private func registerRecordingHotKey(_ shortcut: KeyboardShortcut) -> Bool {
+        if let recordingHotKey { UnregisterEventHotKey(recordingHotKey) }
+        recordingHotKey = nil
+        let identifier = EventHotKeyID(signature: OSType(0x4E475242), id: 2) // NGRB
+        return RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, identifier, GetApplicationEventTarget(), 0, &recordingHotKey) == noErr
     }
 
     @objc private func changeKeyboardShortcut() {
@@ -161,6 +197,100 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func changeRecordingShortcut() {
+        NSApp.activate(ignoringOtherApps: true)
+        let recorder = ShortcutRecorderView(frame: NSRect(x: 0, y: 0, width: 300, height: 68))
+        recorder.shortcut = shortcutSettings.recordingShortcut
+        let alert = NSAlert()
+        alert.messageText = "Choose a recording shortcut"
+        alert.informativeText = "Use this shortcut once to start recording the front window and again to stop."
+        alert.accessoryView = recorder
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = recorder
+        guard alert.runModal() == .alertFirstButtonReturn, let candidate = recorder.shortcut else { return }
+
+        let previous = shortcutSettings.recordingShortcut
+        if registerRecordingHotKey(candidate) {
+            shortcutSettings.recordingShortcut = candidate
+            rebuildMenu()
+        } else {
+            _ = registerRecordingHotKey(previous)
+            showAlert("That shortcut is already used by macOS or another app. Please choose a different combination.")
+        }
+    }
+
+    private var isRecording: Bool {
+        guard #available(macOS 15.0, *), let recorder = videoRecorder as? VideoRecorder else { return false }
+        return recorder.isRecording
+    }
+
+    @objc private func toggleMicrophone() {
+        includeMicrophone.toggle()
+        rebuildMenu()
+    }
+
+    @objc private func toggleWindowRecording() {
+        guard #available(macOS 15.0, *) else {
+            showAlert(VideoRecordingError.unsupportedSystem.localizedDescription)
+            return
+        }
+
+        if let recorder = videoRecorder as? VideoRecorder, recorder.isRecording {
+            showFeedback(symbol: "ellipsis", help: "Finishing recording")
+            Task {
+                do { try await recorder.stop() }
+                catch { await MainActor.run { self.recordingFailed(error) } }
+            }
+            return
+        }
+
+        let recorder = VideoRecorder()
+        videoRecorder = recorder
+        let style = VideoCompositionStyle(
+            background: backgroundStore.image,
+            padding: backgroundStore.padding.points,
+            canvas: backgroundStore.canvas,
+            cornerText: backgroundStore.templateText
+        )
+        let useMicrophone = includeMicrophone
+        showFeedback(symbol: "record.circle", help: "Recording front window")
+        Task {
+            do {
+                try await recorder.start(includeMicrophone: useMicrophone, style: style) { [weak self] result in
+                    guard let self else { return }
+                    self.videoRecorder = nil
+                    self.rebuildMenu()
+                    switch result {
+                    case .success(let url):
+                        let pasteboard = NSPasteboard.general
+                        pasteboard.clearContents()
+                        pasteboard.writeObjects([url as NSURL])
+                        self.captureSound?.play()
+                        self.showFeedback(symbol: "checkmark", help: "Framed MP4 copied")
+                    case .failure(let error):
+                        self.recordingFailed(error)
+                    }
+                }
+                await MainActor.run { self.rebuildMenu() }
+            } catch {
+                await MainActor.run {
+                    self.videoRecorder = nil
+                    self.rebuildMenu()
+                    self.recordingFailed(error)
+                }
+            }
+        }
+    }
+
+    private func recordingFailed(_ error: Error) {
+        if let recordingError = error as? VideoRecordingError, recordingError == .permissionDenied {
+            showScreenRecordingPermissionAlert()
+        } else {
+            showAlert(error.localizedDescription)
+        }
+    }
+
     @objc private func captureFrontWindow() {
         do {
             let background = backgroundStore.image
@@ -170,7 +300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 canvas: backgroundStore.canvas,
                 cornerText: backgroundStore.templateText
             )
-            composer.copyToClipboard(result)
+            try composer.copyToClipboard(result)
             captureSound?.play()
             showFeedback(symbol: "checkmark", help: "Framed screenshot copied")
         } catch CaptureError.permissionDenied {

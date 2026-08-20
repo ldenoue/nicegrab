@@ -1,8 +1,8 @@
 # NiceGrab
 
-NiceGrab is a tiny native macOS menu-bar app for turning ordinary window screenshots into polished, share-ready images.
+NiceGrab is a tiny native macOS menu-bar app for turning ordinary window screenshots and recordings into polished, share-ready media.
 
-Press a global keyboard shortcut and NiceGrab captures the frontmost window, centers it on your chosen background, adds optional template text, and puts the finished image directly on the clipboard.
+Press a global keyboard shortcut and NiceGrab captures the frontmost window, centers it on your chosen background, adds optional template text, and puts the finished image or MP4 file directly on the clipboard.
 
 ## Download
 
@@ -15,7 +15,11 @@ The App Store link will become available as soon as Apple publishes the app.
 ## What it does
 
 - Captures the frontmost macOS window with one global shortcut
-- Copies the composed image directly to the clipboard
+- Saves the composed PNG locally and copies both its image data and file to the clipboard, including support for pasting onto the Desktop
+- Records the frontmost window with its cursor and system audio on macOS 15+
+- Optionally includes microphone audio in recordings
+- Composites recordings over the same background, canvas, and template as screenshots
+- Saves the finished MP4 locally and copies its file to the clipboard
 - Uses any image as the background, or a built-in purple-to-coral gradient
 - Produces adaptive, 16:9, 4:3, or square output
 - Offers compact, comfortable, and spacious canvas padding
@@ -29,9 +33,9 @@ The App Store link will become available as soon as Apple publishes the app.
 
 ## Requirements
 
-- macOS 13 or newer
+- macOS 13 or newer for screenshots; macOS 15 or newer for window recordings
 - Screen Recording permission, used only to capture the selected window
-- Xcode 14 or newer when building from source
+- Xcode 16 or newer when building from source
 
 NiceGrab guides you directly to **System Settings → Privacy & Security → Screen Recording** when permission is missing.
 
@@ -75,11 +79,13 @@ swift run FrameGrab
 5. Press the configured shortcut—**Control–Shift–4** by default.
 6. Paste the finished image into Messages, Mail, X, Slack, a document, or an image editor.
 
+For video, press **Control–Shift–5** to start recording the front window and press it again to stop. System audio and the cursor are included automatically. Turn on **Include Microphone** in the NiceGrab menu when narration is needed. NiceGrab saves the framed MP4 in its local Application Support folder and places the file on the clipboard.
+
 Preferences such as the background, canvas format, padding, template text, and keyboard shortcut persist between launches.
 
 ## Privacy
 
-NiceGrab works locally on your Mac. Screenshots and background images are composited in memory and written to the system clipboard; they are not uploaded anywhere.
+NiceGrab works locally on your Mac. Screenshots, recordings, microphone audio, and background images are processed on the device and are never uploaded.
 
 Read the full [NiceGrab Privacy Policy](PRIVACY.md).
 

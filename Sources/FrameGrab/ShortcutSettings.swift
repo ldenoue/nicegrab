@@ -6,6 +6,7 @@ struct KeyboardShortcut: Equatable {
     var modifiers: UInt32
 
     static let defaultShortcut = KeyboardShortcut(keyCode: UInt32(kVK_ANSI_4), modifiers: UInt32(controlKey | shiftKey))
+    static let defaultRecordingShortcut = KeyboardShortcut(keyCode: UInt32(kVK_ANSI_5), modifiers: UInt32(controlKey | shiftKey))
 
     var displayName: String {
         var result = ""
@@ -57,6 +58,8 @@ final class ShortcutSettings {
     private let defaults = UserDefaults.standard
     private let keyCodeKey = "shortcut.keyCode"
     private let modifiersKey = "shortcut.modifiers"
+    private let recordingKeyCodeKey = "recordingShortcut.keyCode"
+    private let recordingModifiersKey = "recordingShortcut.modifiers"
 
     var shortcut: KeyboardShortcut {
         get {
@@ -69,6 +72,20 @@ final class ShortcutSettings {
         set {
             defaults.set(Int(newValue.keyCode), forKey: keyCodeKey)
             defaults.set(Int(newValue.modifiers), forKey: modifiersKey)
+        }
+    }
+
+    var recordingShortcut: KeyboardShortcut {
+        get {
+            guard defaults.object(forKey: recordingKeyCodeKey) != nil else { return .defaultRecordingShortcut }
+            return KeyboardShortcut(
+                keyCode: UInt32(defaults.integer(forKey: recordingKeyCodeKey)),
+                modifiers: UInt32(defaults.integer(forKey: recordingModifiersKey))
+            )
+        }
+        set {
+            defaults.set(Int(newValue.keyCode), forKey: recordingKeyCodeKey)
+            defaults.set(Int(newValue.modifiers), forKey: recordingModifiersKey)
         }
     }
 }

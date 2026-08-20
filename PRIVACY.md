@@ -6,17 +6,17 @@ NiceGrab is developed by AppBlit LLC. Your privacy is simple: NiceGrab does not 
 
 ## Data processing
 
-NiceGrab processes screenshots entirely on your Mac. Captured windows and background images are composited locally and the resulting image is placed on the macOS clipboard. NiceGrab does not upload these images or their contents to AppBlit LLC or any third party.
+NiceGrab processes screenshots and recordings entirely on your Mac. Captured windows, system audio, optional microphone audio, and background images are composited locally. NiceGrab does not upload this media or its contents to AppBlit LLC or any third party.
 
 ## Permissions
 
-NiceGrab requests macOS Screen Recording permission solely to capture the frontmost window when you activate the capture command.
+NiceGrab requests macOS Screen Recording permission solely to capture the frontmost window when you activate a capture command. Microphone permission is requested only if you enable **Include Microphone** for screen recordings.
 
 When you choose a background image through the macOS file picker, NiceGrab receives read-only access to that user-selected file. A security-scoped bookmark may be stored locally so the app can continue using the selected background between launches.
 
 ## Information stored on your Mac
 
-NiceGrab stores preferences locally, including your selected output format, padding, template, template text, keyboard shortcut, and background-image bookmark. This information remains in the app's sandbox container and is not transmitted.
+NiceGrab stores preferences locally, including your selected output format, padding, template, template text, keyboard shortcuts, microphone preference, and background-image bookmark. Finished PNG screenshots and MP4 recordings are stored in NiceGrab's Application Support folder so their files can be copied and pasted. This information remains in the app's sandbox container and is not transmitted.
 
 ## Analytics and third-party services
 

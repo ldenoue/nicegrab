@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSApplicationCategoryType</key>
@@ -25,6 +25,8 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>NiceGrab captures the front window so it can frame it on your chosen background.</string>
+	<string>NiceGrab captures the front window so it can frame screenshots and recordings on your chosen background.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>NiceGrab uses the microphone only when you enable microphone audio for a screen recording.</string>
 </dict>
 </plist>

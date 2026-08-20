@@ -5,12 +5,14 @@ enum CaptureError: LocalizedError {
     case noWindow
     case permissionDenied
     case renderingFailed
+    case encodingFailed
 
     var errorDescription: String? {
         switch self {
         case .noWindow: "No capturable window was found. Bring the window you want to capture to the front and try again."
         case .permissionDenied: "Screen Recording permission is required. Enable NiceGrab in System Settings → Privacy & Security → Screen Recording, then relaunch it."
         case .renderingFailed: "The framed image could not be rendered."
+        case .encodingFailed: "The framed screenshot could not be saved as a PNG."
         }
     }
 }
@@ -27,10 +29,39 @@ final class ScreenshotComposer {
         return try compose(window: NSImage(cgImage: cgImage, size: .zero), background: background, padding: padding, canvas: canvas, cornerText: cornerText)
     }
 
-    func copyToClipboard(_ image: NSImage) {
+    func copyToClipboard(_ image: NSImage) throws {
+        guard let tiffData = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData),
+              let pngData = bitmap.representation(using: .png, properties: [:]) else {
+            throw CaptureError.encodingFailed
+        }
+
+        let fileURL = try screenshotURL()
+        try pngData.write(to: fileURL, options: .atomic)
+
+        // Finder needs a file URL in order to paste onto the Desktop, while apps
+        // such as Preview and messaging clients prefer image data. Advertising
+        // both representations on one item supports both kinds of destination.
+        let item = NSPasteboardItem()
+        item.setData(pngData, forType: .png)
+        item.setData(tiffData, forType: .tiff)
+        item.setString(fileURL.absoluteString, forType: .fileURL)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
-        pasteboard.writeObjects([image])
+        pasteboard.writeObjects([item])
+    }
+
+    private func screenshotURL() throws -> URL {
+        let root = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ).appendingPathComponent("NiceGrab/Screenshots", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss.SSS"
+        return root.appendingPathComponent("NiceGrab \(formatter.string(from: Date())).png")
     }
 
     private func frontWindowID() -> CGWindowID? {

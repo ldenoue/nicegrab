@@ -6,7 +6,7 @@ enum PaddingOption: String, CaseIterable {
     var title: String { rawValue.capitalized }
     var points: CGFloat {
         switch self {
-        case .compact: 64
+        case .compact: 32
         case .comfortable: 120
         case .spacious: 180
         }
