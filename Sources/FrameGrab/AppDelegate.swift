@@ -10,6 +10,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let composer = ScreenshotComposer()
     private let backgroundStore = BackgroundStore()
     private let shortcutSettings = ShortcutSettings()
+    private lazy var proStore = ProStore { [weak self] in self?.rebuildMenu() }
+    private var effectiveTemplateText: String {
+        guard backgroundStore.template != .none else { return "" }
+        return proStore.isPro ? backgroundStore.templateText : "NiceGrab for macOS"
+    }
     private var includeMicrophone: Bool {
         get { UserDefaults.standard.bool(forKey: "recording.includeMicrophone") }
         set { UserDefaults.standard.set(newValue, forKey: "recording.includeMicrophone") }
@@ -21,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         makeStatusItem()
+        _ = proStore
         installHotKeyHandler()
         _ = registerHotKey(shortcutSettings.shortcut)
         _ = registerRecordingHotKey(shortcutSettings.recordingShortcut)
@@ -111,7 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             item.representedObject = option.rawValue
             item.state = backgroundStore.template == option ? .on : .off
-            let savedText = backgroundStore.text(for: option)
+            let savedText = option == .none ? "" : (proStore.isPro ? backgroundStore.text(for: option) : "NiceGrab for macOS")
             if !savedText.isEmpty {
                 let title = NSMutableAttributedString(
                     string: option.title,
@@ -126,13 +132,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             templateMenu.addItem(item)
         }
         templateMenu.addItem(.separator())
-        let editText = NSMenuItem(title: "Edit Corner Text…", action: #selector(editTemplateText), keyEquivalent: "")
+        let editText = NSMenuItem(
+            title: proStore.isPro ? "Edit Corner Text…" : "Customize Corner Text with Pro…",
+            action: #selector(editTemplateText),
+            keyEquivalent: ""
+        )
         editText.target = self
         editText.isEnabled = backgroundStore.template != .none
         templateMenu.addItem(editText)
         let templates = NSMenuItem(title: "Templates", action: nil, keyEquivalent: "")
         templates.submenu = templateMenu
         menu.addItem(templates)
+
+        menu.addItem(.separator())
+        if proStore.isPro {
+            let pro = NSMenuItem(title: "NiceGrab Pro ✓", action: nil, keyEquivalent: "")
+            pro.isEnabled = false
+            menu.addItem(pro)
+        } else {
+            let purchase = NSMenuItem(title: proStore.purchaseTitle, action: #selector(purchasePro), keyEquivalent: "")
+            purchase.target = self
+            menu.addItem(purchase)
+            let restore = NSMenuItem(title: "Restore Purchases", action: #selector(restorePurchases), keyEquivalent: "")
+            restore.target = self
+            menu.addItem(restore)
+        }
 
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit NiceGrab", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -251,7 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             background: backgroundStore.image,
             padding: backgroundStore.padding.points,
             canvas: backgroundStore.canvas,
-            cornerText: backgroundStore.templateText
+            cornerText: effectiveTemplateText
         )
         let useMicrophone = includeMicrophone
         showFeedback(symbol: "record.circle", help: "Recording front window")
@@ -298,7 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 background: background,
                 padding: backgroundStore.padding.points,
                 canvas: backgroundStore.canvas,
-                cornerText: backgroundStore.templateText
+                cornerText: effectiveTemplateText
             )
             try composer.copyToClipboard(result)
             captureSound?.play()
@@ -350,6 +374,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func editTemplateText() {
         guard backgroundStore.template != .none else { return }
+        guard proStore.isPro else {
+            showProOffer()
+            return
+        }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Edit \(backgroundStore.template.title) corner text"
@@ -366,6 +394,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func purchasePro() {
+        Task {
+            do {
+                try await proStore.purchase()
+                if proStore.isPro { showProUnlocked() }
+            } catch {
+                await MainActor.run { self.showAlert(error.localizedDescription, title: "Couldn’t Purchase NiceGrab Pro") }
+            }
+        }
+    }
+
+    @objc private func restorePurchases() {
+        Task {
+            do {
+                try await proStore.restore()
+                await MainActor.run {
+                    if self.proStore.isPro {
+                        self.showProUnlocked()
+                    } else {
+                        self.showAlert("No NiceGrab Pro purchase was found for this Apple Account.", title: "No Purchase Found")
+                    }
+                }
+            } catch {
+                await MainActor.run { self.showAlert(error.localizedDescription, title: "Couldn’t Restore Purchases") }
+            }
+        }
+    }
+
+    private func showProOffer() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Customize text with NiceGrab Pro"
+        alert.informativeText = "Free captures use “NiceGrab for macOS”. Upgrade once to set your own text for every template."
+        alert.addButton(withTitle: proStore.purchaseTitle)
+        alert.addButton(withTitle: "Not Now")
+        if alert.runModal() == .alertFirstButtonReturn { purchasePro() }
+    }
+
+    private func showProUnlocked() {
+        showAlert("Custom template text is now unlocked on this Mac.", title: "NiceGrab Pro Unlocked")
+    }
+
     private func showFeedback(symbol: String, help: String) {
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: help)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
@@ -373,10 +443,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func showAlert(_ message: String) {
+    private func showAlert(_ message: String, title: String = "NiceGrab couldn’t capture the window") {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "NiceGrab couldn’t capture the window"
+        alert.messageText = title
         alert.informativeText = message
         alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
