@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import CoreImage
 import CoreMedia
+import QuartzCore
 import ScreenCaptureKit
 
 enum VideoRecordingError: LocalizedError {
@@ -37,8 +38,166 @@ struct VideoCompositionStyle {
     let cornerText: String
 }
 
+private struct CursorSample: @unchecked Sendable {
+    let time: TimeInterval
+    let location: CGPoint
+    let isInside: Bool
+    let cursor: NSCursor?
+
+    static func sample(at time: TimeInterval, in samples: [CursorSample]) -> CursorSample? {
+        guard !samples.isEmpty else { return nil }
+        var low = 0
+        var high = samples.count
+        while low < high {
+            let middle = (low + high) / 2
+            if samples[middle].time < time { low = middle + 1 } else { high = middle }
+        }
+        if low == 0 { return samples[0] }
+        if low == samples.count { return samples[samples.count - 1] }
+        let before = samples[low - 1]
+        let after = samples[low]
+        let duration = after.time - before.time
+        guard duration > 0 else { return after }
+        let amount = CGFloat((time - before.time) / duration)
+        return CursorSample(
+            time: time,
+            location: CGPoint(
+                x: before.location.x + (after.location.x - before.location.x) * amount,
+                y: before.location.y + (after.location.y - before.location.y) * amount
+            ),
+            isInside: amount < 0.5 ? before.isInside : after.isInside,
+            cursor: amount < 0.5 ? before.cursor : after.cursor
+        )
+    }
+}
+
+private struct CursorImage {
+    let image: CIImage
+    let extent: CGRect
+    let hotSpot: CGPoint
+    let backingScale: CGFloat
+}
+
+private struct OneEuroFilter {
+    private var previousValue: CGFloat?
+    private var previousRawValue: CGFloat?
+    private var previousDerivative: CGFloat = 0
+    private var previousTime: TimeInterval?
+    let minimumCutoff: CGFloat
+    let beta: CGFloat
+    let derivativeCutoff: CGFloat
+
+    init(minimumCutoff: CGFloat, beta: CGFloat, derivativeCutoff: CGFloat) {
+        self.minimumCutoff = minimumCutoff
+        self.beta = beta
+        self.derivativeCutoff = derivativeCutoff
+    }
+
+    mutating func filter(_ value: CGFloat, at time: TimeInterval) -> CGFloat {
+        guard let previousValue, let previousTime else {
+            self.previousValue = value
+            self.previousRawValue = value
+            self.previousTime = time
+            return value
+        }
+        let delta = max(1.0 / 240.0, time - previousTime)
+        let derivative = (value - (previousRawValue ?? value)) / CGFloat(delta)
+        let filteredDerivative = lowPass(derivative, previous: previousDerivative, cutoff: derivativeCutoff, delta: delta)
+        let cutoff = minimumCutoff + beta * abs(filteredDerivative)
+        let filteredValue = lowPass(value, previous: previousValue, cutoff: cutoff, delta: delta)
+        self.previousValue = filteredValue
+        self.previousRawValue = value
+        self.previousDerivative = filteredDerivative
+        self.previousTime = time
+        return filteredValue
+    }
+
+    private func lowPass(_ value: CGFloat, previous: CGFloat, cutoff: CGFloat, delta: TimeInterval) -> CGFloat {
+        let timeConstant = 1 / (2 * CGFloat.pi * cutoff)
+        let alpha = CGFloat(delta) / (CGFloat(delta) + timeConstant)
+        return alpha * value + (1 - alpha) * previous
+    }
+}
+
+@available(macOS 14.0, *)
+private final class CursorTracker {
+    private let windowFrame: CGRect
+    private var displayLink: CADisplayLink?
+    private var globalMonitor: Any?
+    private var localMonitor: Any?
+    private var samples: [CursorSample] = []
+    private var latestPoint: CGPoint = .zero
+    private var latestCursor: NSCursor?
+    private var xFilter = OneEuroFilter(minimumCutoff: 1, beta: 0.001, derivativeCutoff: 0.8)
+    private var yFilter = OneEuroFilter(minimumCutoff: 1, beta: 0.001, derivativeCutoff: 0.8)
+
+    init(windowFrame: CGRect) {
+        self.windowFrame = windowFrame
+    }
+
+    func start() {
+        updateActualPosition()
+        recordSample()
+        let events: NSEvent.EventTypeMask = [
+            .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
+            .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+            .otherMouseDown, .otherMouseUp
+        ]
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: events) { [weak self] event in
+            self?.updateActualPosition()
+            return event
+        }
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: events) { [weak self] _ in
+            self?.updateActualPosition()
+        }
+        let displayLink = NSScreen.main?.displayLink(target: self, selector: #selector(displayDidRefresh))
+        displayLink?.add(to: .main, forMode: .common)
+        self.displayLink = displayLink
+    }
+
+    @discardableResult
+    func stop() -> [CursorSample] {
+        displayLink?.invalidate()
+        displayLink = nil
+        if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
+        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        globalMonitor = nil
+        localMonitor = nil
+        return samples
+    }
+
+    @objc private func displayDidRefresh() {
+        recordSample()
+    }
+
+    private func updateActualPosition() {
+        if let point = CGEvent(source: nil)?.location {
+            latestPoint = point
+        }
+        latestCursor = NSCursor.currentSystem
+    }
+
+    private func recordSample() {
+        guard windowFrame.width > 0, windowFrame.height > 0 else { return }
+        let point = latestPoint
+        let now = ProcessInfo.processInfo.systemUptime
+        let localX = point.x - windowFrame.minX
+        let localY = point.y - windowFrame.minY
+        let sample = CursorSample(
+            time: now,
+            location: CGPoint(
+                x: xFilter.filter(localX, at: now) / windowFrame.width,
+                y: yFilter.filter(localY, at: now) / windowFrame.height
+            ),
+            isInside: windowFrame.contains(point),
+            cursor: latestCursor
+        )
+        samples.append(sample)
+    }
+}
+
 @available(macOS 15.0, *)
-final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate {
+final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate, SCStreamOutput {
     typealias Completion = (Result<URL, Error>) -> Void
 
     private let ownPID = ProcessInfo.processInfo.processIdentifier
@@ -49,10 +208,18 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
     private var style: VideoCompositionStyle?
     private var completion: Completion?
     private var isStopping = false
+    private var cursorTracker: CursorTracker?
+    private var cursorSamples: [CursorSample] = []
+    private var cursorCaptureScale: CGFloat = 2
+    private let frameTimingQueue = DispatchQueue(label: "NiceGrab.FrameTiming", qos: .userInteractive)
+    private let frameTimingLock = NSLock()
+    private var firstFramePTS: TimeInterval?
+    private var minimumHostMinusPTS: TimeInterval?
 
     var isRecording: Bool { stream != nil }
+    var isFinishing: Bool { isStopping }
 
-    func start(includeMicrophone: Bool, style: VideoCompositionStyle, completion: @escaping Completion) async throws {
+    func start(includeMicrophone: Bool, smoothCursor: Bool, style: VideoCompositionStyle, completion: @escaping Completion) async throws {
         guard !isRecording else { return }
         if includeMicrophone {
             let microphoneAllowed: Bool
@@ -78,11 +245,12 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
 
         let configuration = SCStreamConfiguration()
         let scale = NSScreen.main?.backingScaleFactor ?? 2
+        cursorCaptureScale = scale
         configuration.width = max(2, Int(window.frame.width * scale))
         configuration.height = max(2, Int(window.frame.height * scale))
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
         configuration.queueDepth = 6
-        configuration.showsCursor = true
+        configuration.showsCursor = !smoothCursor
         // H.264 cannot preserve ScreenCaptureKit's transparent shadow pixels.
         // Capture the full decorated window and rebuild its rounded shadow while compositing.
         configuration.ignoreShadowsSingleWindow = true
@@ -105,6 +273,7 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         let output = SCRecordingOutput(configuration: outputConfiguration, delegate: self)
         try stream.addRecordingOutput(output)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameTimingQueue)
 
         self.stream = stream
         self.recordingOutput = output
@@ -113,6 +282,12 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         self.style = style
         self.completion = completion
         self.isStopping = false
+
+        if smoothCursor {
+            let tracker = CursorTracker(windowFrame: window.frame)
+            cursorTracker = tracker
+            tracker.start()
+        }
 
         do {
             try await stream.startCapture()
@@ -125,10 +300,24 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
     func stop() async throws {
         guard let stream, !isStopping else { return }
         isStopping = true
+        cursorSamples = cursorTracker?.stop() ?? []
+        cursorTracker = nil
         try await stream.stopCapture()
     }
 
     func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {}
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
+        guard outputType == .screen, sampleBuffer.isValid else { return }
+        let pts = sampleBuffer.presentationTimeStamp.seconds
+        guard pts.isFinite else { return }
+        let hostTime = ProcessInfo.processInfo.systemUptime
+        frameTimingLock.lock()
+        if firstFramePTS == nil { firstFramePTS = pts }
+        let hostMinusPTS = hostTime - pts
+        minimumHostMinusPTS = min(minimumHostMinusPTS ?? hostMinusPTS, hostMinusPTS)
+        frameTimingLock.unlock()
+    }
 
     func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: Error) {
         finish(.failure(error))
@@ -141,7 +330,16 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         }
         Task {
             do {
-                try await compositeRecording(from: rawURL, to: finalURL, style: style)
+                let samples = cursorTracker?.stop() ?? cursorSamples
+                cursorTracker = nil
+                let videoTimedSamples = cursorSamplesOnVideoTimeline(samples)
+                try await compositeRecording(
+                    from: rawURL,
+                    to: finalURL,
+                    style: style,
+                    cursorSamples: videoTimedSamples,
+                    cursorCaptureScale: cursorCaptureScale
+                )
                 try? FileManager.default.removeItem(at: rawURL)
                 finish(.success(finalURL), removeFiles: false)
             } catch {
@@ -173,6 +371,37 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         style = nil
         completion = nil
         isStopping = false
+        cursorTracker?.stop()
+        cursorTracker = nil
+        cursorSamples = []
+        cursorCaptureScale = 2
+        frameTimingLock.lock()
+        firstFramePTS = nil
+        minimumHostMinusPTS = nil
+        frameTimingLock.unlock()
+    }
+
+    private func cursorSamplesOnVideoTimeline(_ samples: [CursorSample]) -> [CursorSample] {
+        guard !samples.isEmpty else { return [] }
+        frameTimingLock.lock()
+        let firstPTS = firstFramePTS
+        let hostMinusPTS = minimumHostMinusPTS
+        frameTimingLock.unlock()
+
+        let firstVideoFrameHostTime: TimeInterval
+        if let firstPTS, let hostMinusPTS {
+            firstVideoFrameHostTime = firstPTS + hostMinusPTS
+        } else {
+            firstVideoFrameHostTime = samples[0].time
+        }
+        return samples.map {
+            CursorSample(
+                time: $0.time - firstVideoFrameHostTime,
+                location: $0.location,
+                isInside: $0.isInside,
+                cursor: $0.cursor
+            )
+        }
     }
 
     private func frontWindowID() -> CGWindowID? {
@@ -207,7 +436,13 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         )
     }
 
-    private func compositeRecording(from sourceURL: URL, to outputURL: URL, style: VideoCompositionStyle) async throws {
+    private func compositeRecording(
+        from sourceURL: URL,
+        to outputURL: URL,
+        style: VideoCompositionStyle,
+        cursorSamples: [CursorSample],
+        cursorCaptureScale: CGFloat
+    ) async throws {
         let asset = AVURLAsset(url: sourceURL)
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw VideoRecordingError.couldNotProcess
@@ -232,6 +467,14 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         )
         let radius = min(14, targetSize.width / 20, targetSize.height / 20)
         let mask = makeRoundedMask(rect: targetRect, canvasExtent: canvasExtent, radius: radius)
+        var cursorImages: [ObjectIdentifier: CursorImage] = [:]
+        for sample in cursorSamples {
+            guard let cursor = sample.cursor else { continue }
+            let identifier = ObjectIdentifier(cursor)
+            if cursorImages[identifier] == nil {
+                cursorImages[identifier] = makeCursorImage(cursor)
+            }
+        }
 
         let composition = AVMutableVideoComposition(asset: asset) { request in
             let source = request.sourceImage.clampedToExtent().cropped(to: request.sourceImage.extent)
@@ -239,8 +482,29 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
                 .scaledBy(x: scale, y: scale)
                 .translatedBy(x: targetRect.minX / scale, y: targetRect.minY / scale)
             let framed = source.transformed(by: transform)
+            var framedWithCursor = framed
+            if let cursor = CursorSample.sample(at: request.compositionTime.seconds, in: cursorSamples),
+               cursor.isInside,
+               let systemCursor = cursor.cursor,
+               let cursorImage = cursorImages[ObjectIdentifier(systemCursor)] {
+                let sourcePoint = CGPoint(
+                    x: cursor.location.x * naturalSize.width,
+                    y: (1 - cursor.location.y) * naturalSize.height
+                )
+                // The cursor is rasterized at 8x to keep the requested 2x display
+                // size crisp, even after the window is scaled into the canvas.
+                let cursorScale = scale * 2 * cursorCaptureScale / cursorImage.backingScale
+                let cursorOrigin = CGPoint(
+                    x: targetRect.minX + sourcePoint.x * scale - cursorImage.hotSpot.x * cursorScale,
+                    y: targetRect.minY + sourcePoint.y * scale - (cursorImage.extent.height - cursorImage.hotSpot.y) * cursorScale
+                )
+                let placedCursor = cursorImage.image
+                    .transformed(by: CGAffineTransform(scaleX: cursorScale, y: cursorScale))
+                    .transformed(by: CGAffineTransform(translationX: cursorOrigin.x, y: cursorOrigin.y))
+                framedWithCursor = placedCursor.composited(over: framed)
+            }
             let transparentCanvas = CIImage(color: .clear).cropped(to: canvasExtent)
-            let roundedWindow = framed.applyingFilter("CIBlendWithAlphaMask", parameters: [
+            let roundedWindow = framedWithCursor.applyingFilter("CIBlendWithAlphaMask", parameters: [
                 kCIInputBackgroundImageKey: transparentCanvas,
                 kCIInputMaskImageKey: mask
             ])
@@ -278,12 +542,62 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         }
         composition.renderSize = canvasSize
         composition.frameDuration = CMTime(value: 1, timescale: 60)
+        if !cursorSamples.isEmpty {
+            // ScreenCaptureKit may encode a variable-frame-rate track and omit
+            // samples while only the separately monitored cursor is moving.
+            // Synthetic-cursor recordings therefore need an independent 60-fps
+            // output clock. Native-cursor recordings can preserve sparse source
+            // timing, avoiding needless frame rendering and a slower export.
+            composition.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
+        }
 
         guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
             throw VideoRecordingError.couldNotProcess
         }
         exporter.videoComposition = composition
         try await exporter.export(to: outputURL, as: .mp4)
+    }
+
+    private func makeCursorImage(_ cursor: NSCursor) -> CursorImage? {
+        let backingScale: CGFloat = 8
+        let pixelWidth = max(1, Int((cursor.image.size.width * backingScale).rounded()))
+        let pixelHeight = max(1, Int((cursor.image.size.height * backingScale).rounded()))
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelWidth,
+            pixelsHigh: pixelHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bitmapFormat: .alphaFirst,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        guard let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            NSGraphicsContext.restoreGraphicsState()
+            return nil
+        }
+        NSGraphicsContext.current = context
+        context.imageInterpolation = .high
+        cursor.image.draw(
+            in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight),
+            from: .zero,
+            operation: .copy,
+            fraction: 1
+        )
+        context.flushGraphics()
+        NSGraphicsContext.restoreGraphicsState()
+        guard let cgImage = bitmap.cgImage else { return nil }
+        let image = CIImage(cgImage: cgImage)
+        return CursorImage(
+            image: image,
+            extent: image.extent,
+            hotSpot: CGPoint(x: cursor.hotSpot.x * backingScale, y: cursor.hotSpot.y * backingScale),
+            backingScale: backingScale
+        )
     }
 
     private func makeRoundedMask(rect: CGRect, canvasExtent: CGRect, radius: CGFloat) -> CIImage {

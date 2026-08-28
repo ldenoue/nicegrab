@@ -7,6 +7,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recordingHotKey: EventHotKeyRef?
     private var hotKeyHandler: EventHandlerRef?
     private var videoRecorder: AnyObject?
+    private var isStartingRecording = false
+    private var recordingStatusTimer: Timer?
+    private var recordingStartedAt: Date?
+    private var processingSpinnerTimer: Timer?
+    private var processingSpinnerAngle: CGFloat = 0
     private let composer = ScreenshotComposer()
     private let backgroundStore = BackgroundStore()
     private let shortcutSettings = ShortcutSettings()
@@ -18,6 +23,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var includeMicrophone: Bool {
         get { UserDefaults.standard.bool(forKey: "recording.includeMicrophone") }
         set { UserDefaults.standard.set(newValue, forKey: "recording.includeMicrophone") }
+    }
+    private var smoothCursor: Bool {
+        get {
+            let key = "recording.smoothCursor"
+            return UserDefaults.standard.object(forKey: key) == nil || UserDefaults.standard.bool(forKey: key)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: "recording.smoothCursor") }
     }
     private lazy var captureSound: NSSound? = {
         let systemSound = URL(fileURLWithPath: "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Screen Capture.aif")
@@ -33,6 +45,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        recordingStatusTimer?.invalidate()
+        processingSpinnerTimer?.invalidate()
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let recordingHotKey { UnregisterEventHotKey(recordingHotKey) }
         if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
@@ -69,6 +83,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         microphone.state = includeMicrophone ? .on : .off
         microphone.isEnabled = !isRecording
         menu.addItem(microphone)
+        let cursor = NSMenuItem(title: "Smooth Cursor", action: #selector(toggleSmoothCursor), keyEquivalent: "")
+        cursor.target = self
+        cursor.state = smoothCursor ? .on : .off
+        cursor.isEnabled = !isRecording
+        menu.addItem(cursor)
         menu.addItem(.separator())
 
         let backgroundTitle = backgroundStore.displayName.map { "Background: \($0)" } ?? "Background: Default Gradient"
@@ -161,7 +180,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit NiceGrab", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
-        statusItem.menu = menu
+        if isProcessingRecording {
+            showProcessingStatus()
+        } else if isRecording {
+            statusItem.menu = nil
+            statusItem.button?.target = self
+            statusItem.button?.action = #selector(toggleWindowRecording)
+            updateRecordingStatus()
+        } else {
+            stopRecordingStatus()
+            statusItem.button?.target = nil
+            statusItem.button?.action = nil
+            statusItem.button?.image = NSImage(
+                systemSymbolName: "macwindow.on.rectangle",
+                accessibilityDescription: "NiceGrab"
+            )
+            statusItem.menu = menu
+        }
     }
 
     private func installHotKeyHandler() {
@@ -249,8 +284,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return recorder.isRecording
     }
 
+    private var isProcessingRecording: Bool {
+        guard #available(macOS 15.0, *), let recorder = videoRecorder as? VideoRecorder else { return false }
+        return recorder.isFinishing
+    }
+
     @objc private func toggleMicrophone() {
         includeMicrophone.toggle()
+        rebuildMenu()
+    }
+
+    @objc private func toggleSmoothCursor() {
+        smoothCursor.toggle()
         rebuildMenu()
     }
 
@@ -261,15 +306,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if let recorder = videoRecorder as? VideoRecorder, recorder.isRecording {
-            showFeedback(symbol: "ellipsis", help: "Finishing recording")
+            showProcessingStatus()
             Task {
                 do { try await recorder.stop() }
-                catch { await MainActor.run { self.recordingFailed(error) } }
+                catch {
+                    await MainActor.run {
+                        self.rebuildMenu()
+                        self.recordingFailed(error)
+                    }
+                }
             }
             return
         }
+        guard !isStartingRecording else { return }
 
         let recorder = VideoRecorder()
+        isStartingRecording = true
         videoRecorder = recorder
         let style = VideoCompositionStyle(
             background: backgroundStore.image,
@@ -278,12 +330,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             cornerText: effectiveTemplateText
         )
         let useMicrophone = includeMicrophone
+        let useSmoothCursor = smoothCursor
         showFeedback(symbol: "record.circle", help: "Recording front window")
         Task {
             do {
-                try await recorder.start(includeMicrophone: useMicrophone, style: style) { [weak self] result in
+                try await recorder.start(includeMicrophone: useMicrophone, smoothCursor: useSmoothCursor, style: style) { [weak self] result in
                     guard let self else { return }
                     self.videoRecorder = nil
+                    self.stopRecordingStatus()
                     self.rebuildMenu()
                     switch result {
                     case .success(let url):
@@ -296,10 +350,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.recordingFailed(error)
                     }
                 }
-                await MainActor.run { self.rebuildMenu() }
+                await MainActor.run {
+                    self.isStartingRecording = false
+                    self.startRecordingStatus()
+                    self.rebuildMenu()
+                }
             } catch {
                 await MainActor.run {
+                    self.isStartingRecording = false
                     self.videoRecorder = nil
+                    self.stopRecordingStatus()
                     self.rebuildMenu()
                     self.recordingFailed(error)
                 }
@@ -439,8 +499,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showFeedback(symbol: String, help: String) {
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: help)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            self?.statusItem.button?.image = NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "NiceGrab")
+            guard let self else { return }
+            guard self.processingSpinnerTimer == nil else { return }
+            if self.isRecording {
+                self.statusItem.button?.image = NSImage(
+                    systemSymbolName: "record.circle.fill",
+                    accessibilityDescription: "Stop window recording"
+                )
+            } else {
+                self.statusItem.button?.image = NSImage(
+                    systemSymbolName: "macwindow.on.rectangle",
+                    accessibilityDescription: "NiceGrab"
+                )
+            }
         }
+    }
+
+    private func startRecordingStatus() {
+        recordingStatusTimer?.invalidate()
+        recordingStartedAt = Date()
+        updateRecordingStatus()
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            self?.updateRecordingStatus()
+        }
+        recordingStatusTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopRecordingStatus() {
+        recordingStatusTimer?.invalidate()
+        recordingStatusTimer = nil
+        recordingStartedAt = nil
+        processingSpinnerTimer?.invalidate()
+        processingSpinnerTimer = nil
+        processingSpinnerAngle = 0
+        statusItem.length = NSStatusItem.squareLength
+        statusItem.button?.title = ""
+        statusItem.button?.font = nil
+        statusItem.button?.isEnabled = true
+    }
+
+    private func updateRecordingStatus() {
+        guard let recordingStartedAt else { return }
+        let elapsed = max(0, Int(Date().timeIntervalSince(recordingStartedAt)))
+        let minutes = elapsed / 60
+        let seconds = elapsed % 60
+        statusItem.length = NSStatusItem.variableLength
+        statusItem.button?.image = NSImage(
+            systemSymbolName: "record.circle.fill",
+            accessibilityDescription: "Stop window recording"
+        )
+        statusItem.button?.imagePosition = .imageLeading
+        statusItem.button?.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        let timeText = String(format: "%02d:%02d", minutes, seconds)
+        statusItem.button?.title = " " + timeText
+        statusItem.button?.toolTip = "Recording " + timeText + " — click to stop"
+    }
+
+    private func showProcessingStatus() {
+        recordingStatusTimer?.invalidate()
+        recordingStatusTimer = nil
+        recordingStartedAt = nil
+        statusItem.menu = nil
+        statusItem.length = NSStatusItem.squareLength
+        statusItem.button?.target = nil
+        statusItem.button?.action = nil
+        statusItem.button?.title = ""
+        statusItem.button?.image = nil
+        statusItem.button?.isEnabled = false
+        statusItem.button?.toolTip = "Generating final video…"
+
+        guard processingSpinnerTimer == nil else { return }
+        updateProcessingSpinner()
+        let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.processingSpinnerAngle += 12
+            self.updateProcessingSpinner()
+        }
+        processingSpinnerTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func updateProcessingSpinner() {
+        guard let symbol = NSImage(
+            systemSymbolName: "arrow.triangle.2.circlepath",
+            accessibilityDescription: "Generating final video"
+        )?.withSymbolConfiguration(.init(pointSize: 14, weight: .regular)) else { return }
+        let size = NSSize(width: 18, height: 18)
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSGraphicsContext.saveGraphicsState()
+            let transform = NSAffineTransform()
+            transform.translateX(by: rect.midX, yBy: rect.midY)
+            transform.rotate(byDegrees: self.processingSpinnerAngle)
+            transform.translateX(by: -rect.midX, yBy: -rect.midY)
+            transform.concat()
+            symbol.draw(in: NSRect(x: 2, y: 2, width: 14, height: 14))
+            NSGraphicsContext.restoreGraphicsState()
+            return true
+        }
+        image.isTemplate = true
+        statusItem.button?.image = image
     }
 
     private func showAlert(_ message: String, title: String = "NiceGrab couldn’t capture the window") {
