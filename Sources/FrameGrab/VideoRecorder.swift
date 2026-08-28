@@ -212,6 +212,8 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
     private var cursorSamples: [CursorSample] = []
     private var cursorCaptureScale: CGFloat = 2
     private let frameTimingQueue = DispatchQueue(label: "NiceGrab.FrameTiming", qos: .userInteractive)
+    private let audioSinkQueue = DispatchQueue(label: "NiceGrab.AudioSink", qos: .userInitiated)
+    private let microphoneSinkQueue = DispatchQueue(label: "NiceGrab.MicrophoneSink", qos: .userInitiated)
     private let frameTimingLock = NSLock()
     private var firstFramePTS: TimeInterval?
     private var minimumHostMinusPTS: TimeInterval?
@@ -274,6 +276,10 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         let output = SCRecordingOutput(configuration: outputConfiguration, delegate: self)
         try stream.addRecordingOutput(output)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameTimingQueue)
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioSinkQueue)
+        if includeMicrophone {
+            try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: microphoneSinkQueue)
+        }
 
         self.stream = stream
         self.recordingOutput = output
