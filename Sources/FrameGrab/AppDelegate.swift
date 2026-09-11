@@ -17,8 +17,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let shortcutSettings = ShortcutSettings()
     private lazy var proStore = ProStore { [weak self] in self?.rebuildMenu() }
     private var effectiveTemplateText: String {
-        guard backgroundStore.template != .none else { return "" }
-        return proStore.isPro ? backgroundStore.templateText : "NiceGrab for macOS"
+        guard proStore.isPro else { return "NiceGrab for macOS" }
+        return backgroundStore.template == .none ? "" : backgroundStore.templateText
     }
     private var includeMicrophone: Bool {
         get { UserDefaults.standard.bool(forKey: "recording.includeMicrophone") }
@@ -136,7 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             item.representedObject = option.rawValue
             item.state = backgroundStore.template == option ? .on : .off
-            let savedText = option == .none ? "" : (proStore.isPro ? backgroundStore.text(for: option) : "NiceGrab for macOS")
+            let savedText = proStore.isPro ? backgroundStore.text(for: option) : "NiceGrab for macOS"
             if !savedText.isEmpty {
                 let title = NSMutableAttributedString(
                     string: option.title,
@@ -157,7 +157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         )
         editText.target = self
-        editText.isEnabled = backgroundStore.template != .none
+        editText.isEnabled = !proStore.isPro || backgroundStore.template != .none
         templateMenu.addItem(editText)
         let templates = NSMenuItem(title: "Templates", action: nil, keyEquivalent: "")
         templates.submenu = templateMenu
@@ -433,11 +433,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func editTemplateText() {
-        guard backgroundStore.template != .none else { return }
         guard proStore.isPro else {
-            showProOffer()
+            purchasePro()
             return
         }
+        guard backgroundStore.template != .none else { return }
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Edit \(backgroundStore.template.title) corner text"
@@ -480,16 +480,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await MainActor.run { self.showAlert(error.localizedDescription, title: "Couldn’t Restore Purchases") }
             }
         }
-    }
-
-    private func showProOffer() {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = "Customize text with NiceGrab Pro"
-        alert.informativeText = "Free captures use “NiceGrab for macOS”. Upgrade once to set your own text for every template."
-        alert.addButton(withTitle: proStore.purchaseTitle)
-        alert.addButton(withTitle: "Not Now")
-        if alert.runModal() == .alertFirstButtonReturn { purchasePro() }
     }
 
     private func showProUnlocked() {

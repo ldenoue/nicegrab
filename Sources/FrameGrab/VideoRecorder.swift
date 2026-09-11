@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import CoreImage
 import CoreMedia
+import CoreText
 import QuartzCore
 import ScreenCaptureKit
 
@@ -638,16 +639,31 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
 
     private func makeCornerText(_ text: String, extent: CGRect) -> CIImage? {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        let image = NSImage(size: extent.size)
-        image.lockFocusFlipped(false)
-        defer { image.unlockFocus() }
+        let pixelWidth = max(1, Int(extent.width.rounded(.up)))
+        let pixelHeight = max(1, Int(extent.height.rounded(.up)))
+        guard let context = CGContext(
+            data: nil,
+            width: pixelWidth,
+            height: pixelHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
         let fontSize = max(14, min(24, extent.width / 60))
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold),
-            .foregroundColor: NSColor.white
-        ]
-        let string = NSAttributedString(string: text, attributes: attributes)
-        let textSize = string.size()
+        let appKitFont = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+        let font = CTFontCreateWithName(appKitFont.fontName as CFString, fontSize, nil)
+        let attributes = [
+            kCTFontAttributeName: font,
+            kCTForegroundColorAttributeName: NSColor.white.cgColor
+        ] as CFDictionary
+        guard let attributedString = CFAttributedStringCreate(nil, text as CFString, attributes) else { return nil }
+        let line = CTLineCreateWithAttributedString(attributedString)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        let textWidth = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+        let textSize = CGSize(width: ceil(textWidth), height: ceil(ascent + descent + leading))
         let horizontalInset: CGFloat = 18
         let verticalInset: CGFloat = 10
         let edgeInset = max(24, extent.width / 64)
@@ -657,10 +673,16 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
             width: textSize.width + horizontalInset * 2,
             height: textSize.height + verticalInset * 2
         )
-        NSColor.black.withAlphaComponent(0.48).setFill()
-        NSBezierPath(roundedRect: pill, xRadius: pill.height / 2, yRadius: pill.height / 2).fill()
-        string.draw(at: NSPoint(x: pill.minX + horizontalInset, y: pill.minY + verticalInset))
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        context.setFillColor(NSColor.black.withAlphaComponent(0.48).cgColor)
+        context.addPath(CGPath(roundedRect: pill, cornerWidth: pill.height / 2, cornerHeight: pill.height / 2, transform: nil))
+        context.fillPath()
+        context.textMatrix = .identity
+        context.textPosition = CGPoint(
+            x: pill.minX + horizontalInset,
+            y: pill.minY + verticalInset + descent
+        )
+        CTLineDraw(line, context)
+        guard let cgImage = context.makeImage() else { return nil }
         return CIImage(cgImage: cgImage)
     }
 }
