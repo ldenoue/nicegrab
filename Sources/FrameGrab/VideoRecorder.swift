@@ -79,6 +79,31 @@ private struct CursorImage {
     let backingScale: CGFloat
 }
 
+private final class MP4WritingContext: @unchecked Sendable {
+    let reader: AVAssetReader
+    let writer: AVAssetWriter
+    let videoOutput: AVAssetReaderVideoCompositionOutput
+    let videoInput: AVAssetWriterInput
+    let audioOutput: AVAssetReaderAudioMixOutput?
+    let audioInput: AVAssetWriterInput?
+
+    init(
+        reader: AVAssetReader,
+        writer: AVAssetWriter,
+        videoOutput: AVAssetReaderVideoCompositionOutput,
+        videoInput: AVAssetWriterInput,
+        audioOutput: AVAssetReaderAudioMixOutput?,
+        audioInput: AVAssetWriterInput?
+    ) {
+        self.reader = reader
+        self.writer = writer
+        self.videoOutput = videoOutput
+        self.videoInput = videoInput
+        self.audioOutput = audioOutput
+        self.audioInput = audioInput
+    }
+}
+
 private struct OneEuroFilter {
     private var previousValue: CGFloat?
     private var previousRawValue: CGFloat?
@@ -455,7 +480,13 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
             throw VideoRecordingError.couldNotProcess
         }
         let naturalSize = try await videoTrack.load(.naturalSize)
-        let canvasSize = style.canvas.size(for: naturalSize, padding: style.padding)
+        let requestedCanvasSize = style.canvas.size(for: naturalSize, padding: style.padding)
+        // 4:2:0 H.264 needs even dimensions. Adaptive canvases inherit the
+        // captured window's pixel size, which can occasionally be odd.
+        let canvasSize = CGSize(
+            width: ceil(requestedCanvasSize.width / 2) * 2,
+            height: ceil(requestedCanvasSize.height / 2) * 2
+        )
         let canvasExtent = CGRect(origin: .zero, size: canvasSize)
         let background = makeBackground(style.background, extent: canvasExtent)
         let overlay = makeCornerText(style.cornerText, extent: canvasExtent)
@@ -558,11 +589,174 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
             composition.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
         }
 
-        guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality) else {
-            throw VideoRecordingError.couldNotProcess
+        try await writeCompatibleMP4(
+            asset: asset,
+            videoTrack: videoTrack,
+            videoComposition: composition,
+            canvasSize: canvasSize,
+            outputURL: outputURL
+        )
+    }
+
+    private func writeCompatibleMP4(
+        asset: AVAsset,
+        videoTrack: AVAssetTrack,
+        videoComposition: AVVideoComposition,
+        canvasSize: CGSize,
+        outputURL: URL
+    ) async throws {
+        let reader = try AVAssetReader(asset: asset)
+        let videoOutput = AVAssetReaderVideoCompositionOutput(
+            videoTracks: [videoTrack],
+            videoSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ]
+        )
+        videoOutput.videoComposition = videoComposition
+        videoOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(videoOutput) else { throw VideoRecordingError.couldNotProcess }
+        reader.add(videoOutput)
+
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        // Put the movie index before media data so chat clients can inspect and
+        // generate a preview without first downloading the whole recording.
+        writer.shouldOptimizeForNetworkUse = true
+
+        let width = Int(canvasSize.width.rounded())
+        let height = Int(canvasSize.height.rounded())
+        // Screen recordings compress well. This targets about 4 Mbps at
+        // 1080p60, scaling with pixel count while retaining crisp UI text.
+        let bitsPerSecond = min(
+            8_000_000,
+            max(1_000_000, Int(Double(width * height * 60) * 0.032))
+        )
+        let videoInput = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoColorPropertiesKey: [
+                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+                ],
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: bitsPerSecond,
+                    AVVideoExpectedSourceFrameRateKey: 60,
+                    AVVideoMaxKeyFrameIntervalKey: 120,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                ]
+            ]
+        )
+        videoInput.expectsMediaDataInRealTime = false
+        guard writer.canAdd(videoInput) else { throw VideoRecordingError.couldNotProcess }
+        // Adding video first makes it track 1. Some chat preview pipelines do
+        // not reliably discover video when an audio track comes first.
+        writer.add(videoInput)
+
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        var audioOutput: AVAssetReaderAudioMixOutput?
+        var audioInput: AVAssetWriterInput?
+        if !audioTracks.isEmpty {
+            let output = AVAssetReaderAudioMixOutput(
+                audioTracks: audioTracks,
+                audioSettings: [AVFormatIDKey: kAudioFormatLinearPCM]
+            )
+            let input = AVAssetWriterInput(
+                mediaType: .audio,
+                outputSettings: [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVSampleRateKey: 48_000,
+                    AVNumberOfChannelsKey: 2,
+                    AVEncoderBitRateKey: 128_000
+                ]
+            )
+            input.expectsMediaDataInRealTime = false
+            guard reader.canAdd(output), writer.canAdd(input) else {
+                throw VideoRecordingError.couldNotProcess
+            }
+            reader.add(output)
+            writer.add(input)
+            audioOutput = output
+            audioInput = input
         }
-        exporter.videoComposition = composition
-        try await exporter.export(to: outputURL, as: .mp4)
+
+        guard writer.startWriting() else {
+            throw writer.error ?? VideoRecordingError.couldNotProcess
+        }
+        writer.startSession(atSourceTime: .zero)
+        guard reader.startReading() else {
+            writer.cancelWriting()
+            throw reader.error ?? VideoRecordingError.couldNotProcess
+        }
+
+        let context = MP4WritingContext(
+            reader: reader,
+            writer: writer,
+            videoOutput: videoOutput,
+            videoInput: videoInput,
+            audioOutput: audioOutput,
+            audioInput: audioInput
+        )
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let group = DispatchGroup()
+            let videoQueue = DispatchQueue(label: "NiceGrab.VideoEncoder", qos: .userInitiated)
+            group.enter()
+            context.videoInput.requestMediaDataWhenReady(on: videoQueue) {
+                while context.videoInput.isReadyForMoreMediaData {
+                    guard let sample = context.videoOutput.copyNextSampleBuffer() else {
+                        context.videoInput.markAsFinished()
+                        group.leave()
+                        return
+                    }
+                    guard context.videoInput.append(sample) else {
+                        context.reader.cancelReading()
+                        context.videoInput.markAsFinished()
+                        group.leave()
+                        return
+                    }
+                }
+            }
+
+            if let audioInput = context.audioInput {
+                let audioQueue = DispatchQueue(label: "NiceGrab.AudioEncoder", qos: .userInitiated)
+                group.enter()
+                audioInput.requestMediaDataWhenReady(on: audioQueue) {
+                    guard let contextAudioInput = context.audioInput,
+                          let contextAudioOutput = context.audioOutput else {
+                        group.leave()
+                        return
+                    }
+                    while contextAudioInput.isReadyForMoreMediaData {
+                        guard let sample = contextAudioOutput.copyNextSampleBuffer() else {
+                            contextAudioInput.markAsFinished()
+                            group.leave()
+                            return
+                        }
+                        guard contextAudioInput.append(sample) else {
+                            context.reader.cancelReading()
+                            contextAudioInput.markAsFinished()
+                            group.leave()
+                            return
+                        }
+                    }
+                }
+            }
+
+            group.notify(queue: DispatchQueue.global(qos: .userInitiated)) {
+                context.writer.finishWriting {
+                    if context.writer.status == .completed {
+                        continuation.resume()
+                    } else {
+                        continuation.resume(
+                            throwing: context.writer.error ?? context.reader.error ?? VideoRecordingError.couldNotProcess
+                        )
+                    }
+                }
+            }
+        }
     }
 
     private func makeCursorImage(_ cursor: NSCursor) -> CursorImage? {
