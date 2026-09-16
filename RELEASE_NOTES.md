@@ -1,3 +1,5 @@
 # What's New in NiceGrab 1.6
 
-Long recordings are now smaller, easier, and more reliable. NiceGrab uses a screen-optimized export profile, fixes shadows and smooth-cursor placement when a window moves, shows live encoding progress, avoids an issue that could prevent some window sizes from recording, and preserves the original recording if final processing fails. Free exports carry a discreet NiceGrab watermark, with clearer upgrade guidance and Pro-only watermark controls. Custom background imports are more reliable, and new welcome and Help pages make NiceGrab easier to learn.
+Recordings are now ready almost instantly. NiceGrab applies your background, layout, shadow, watermark, and smooth cursor while you record, so there is no long processing step when you finish. Videos stay fluid at 60 fps, with sharper text and window edges, smaller file sizes, and more reliable cursor positioning when a window moves.
+
+NiceGrab also includes a new illustrated default background. You can preview the current background in the menu or simply drag an image onto the NiceGrab menu-bar icon to replace it. This release also improves recording shadows and edges, adds clearer Free and Pro watermark controls, and expands the welcome and Help pages for new users.
