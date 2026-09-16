@@ -66,16 +66,15 @@ private final class LiveWritingContext: @unchecked Sendable {
     let microphoneInput: AVAssetWriterInput?
     let ciContext: CIContext
     let colorSpace: CGColorSpace
-    let sourceSize: CGSize
     let canvasSize: CGSize
     let canvasExtent: CGRect
     let targetRect: CGRect
-    let scale: CGFloat
     let mask: CIImage
     let shadow: CIImage
     let background: CIImage
     let overlay: CIImage?
     var latestSourcePixelBuffer: CVPixelBuffer?
+    var latestSourceRect: CGRect?
     var sessionStartPTS: CMTime?
     var lastVideoFrameIndex: Int64 = -1
     var lastVideoPTS: CMTime?
@@ -90,10 +89,8 @@ private final class LiveWritingContext: @unchecked Sendable {
         microphoneInput: AVAssetWriterInput?,
         ciContext: CIContext,
         colorSpace: CGColorSpace,
-        sourceSize: CGSize,
         canvasSize: CGSize,
         targetRect: CGRect,
-        scale: CGFloat,
         mask: CIImage,
         shadow: CIImage,
         background: CIImage,
@@ -106,11 +103,9 @@ private final class LiveWritingContext: @unchecked Sendable {
         self.microphoneInput = microphoneInput
         self.ciContext = ciContext
         self.colorSpace = colorSpace
-        self.sourceSize = sourceSize
         self.canvasSize = canvasSize
         self.canvasExtent = CGRect(origin: .zero, size: canvasSize)
         self.targetRect = targetRect
-        self.scale = scale
         self.mask = mask
         self.shadow = shadow
         self.background = background
@@ -264,14 +259,12 @@ private final class CursorTracker {
 @available(macOS 15.0, *)
 final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
     typealias Completion = (Result<URL, Error>) -> Void
-    typealias ProgressHandler = @MainActor (Double) -> Void
 
     private let ownPID = ProcessInfo.processInfo.processIdentifier
     private var stream: SCStream?
     private var finalURL: URL?
     private var writingContext: LiveWritingContext?
     private var completion: Completion?
-    private var progressHandler: ProgressHandler?
     private var isStopping = false
     private var cursorTracker: CursorTracker?
     private var cursorCaptureScale: CGFloat = 2
@@ -285,7 +278,6 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
         includeMicrophone: Bool,
         smoothCursor: Bool,
         style: VideoCompositionStyle,
-        progress: @escaping ProgressHandler,
         completion: @escaping Completion
     ) async throws {
         guard !isRecording else { return }
@@ -354,7 +346,6 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
         self.stream = stream
         self.finalURL = outputURL
         self.writingContext = context
-        self.progressHandler = progress
         self.completion = completion
         self.isStopping = false
 
@@ -380,7 +371,6 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
     func stop() async throws {
         guard let stream, !isStopping else { return }
         isStopping = true
-        reportProgress(0.85)
         frameTimer?.cancel()
         frameTimer = nil
         cursorTracker?.stop()
@@ -388,7 +378,6 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
         do {
             try await stream.stopCapture()
             try await finishLiveWriting()
-            reportProgress(1)
             guard let finalURL else { throw VideoRecordingError.couldNotProcess }
             finish(.success(finalURL), removeFiles: false)
         } catch {
@@ -443,19 +432,10 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
         finalURL = nil
         writingContext = nil
         completion = nil
-        progressHandler = nil
         isStopping = false
         cursorTracker?.stop()
         cursorTracker = nil
         cursorCaptureScale = 2
-    }
-
-    private func reportProgress(_ progress: Double) {
-        guard let progressHandler else { return }
-        let clampedProgress = max(0, min(1, progress))
-        Task { @MainActor in
-            progressHandler(clampedProgress)
-        }
     }
 
     private func recordingURL() throws -> URL {
@@ -580,10 +560,8 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
             microphoneInput: microphoneInput,
             ciContext: CIContext(),
             colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
-            sourceSize: sourceSize,
             canvasSize: canvasSize,
             targetRect: targetRect,
-            scale: scale,
             mask: makeRoundedMask(rect: targetRect, canvasExtent: canvasExtent, radius: radius),
             shadow: makeWindowShadow(rect: targetRect, canvasExtent: canvasExtent, radius: radius),
             background: makeBackground(style.background, extent: canvasExtent),
@@ -617,6 +595,7 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
               let pixelBuffer = sampleBuffer.imageBuffer else { return }
 
         context.latestSourcePixelBuffer = pixelBuffer
+        context.latestSourceRect = frameContentRect(from: attachments, pixelBuffer: pixelBuffer)
         if context.sessionStartPTS == nil {
             let startPTS = sampleBuffer.presentationTimeStamp
             context.writer.startSession(atSourceTime: startPTS)
@@ -629,6 +608,7 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
         guard context.failure == nil,
               let startPTS = context.sessionStartPTS,
               let sourcePixelBuffer = context.latestSourcePixelBuffer,
+              let sourceRect = context.latestSourceRect,
               hostTime >= startPTS else { return }
         let elapsed = CMTimeSubtract(hostTime, startPTS).seconds
         guard elapsed.isFinite else { return }
@@ -645,11 +625,17 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
             return
         }
 
-        let source = CIImage(cvPixelBuffer: sourcePixelBuffer)
-            .cropped(to: CGRect(origin: .zero, size: context.sourceSize))
-        let transform = CGAffineTransform(translationX: -source.extent.minX, y: -source.extent.minY)
-            .scaledBy(x: context.scale, y: context.scale)
-            .translatedBy(x: context.targetRect.minX / context.scale, y: context.targetRect.minY / context.scale)
+        let source = CIImage(cvPixelBuffer: sourcePixelBuffer).cropped(to: sourceRect)
+        let frameScaleX = context.targetRect.width / sourceRect.width
+        let frameScaleY = context.targetRect.height / sourceRect.height
+        let transform = CGAffineTransform(
+            a: frameScaleX,
+            b: 0,
+            c: 0,
+            d: frameScaleY,
+            tx: context.targetRect.minX - sourceRect.minX * frameScaleX,
+            ty: context.targetRect.minY - sourceRect.minY * frameScaleY
+        )
         var framed = source.transformed(by: transform)
         if let cursor = cursorTracker?.currentSample(),
            cursor.isInside,
@@ -663,14 +649,10 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
                 context.cursorImages[identifier] = cursorImage
             }
             if let cursorImage {
-                let sourcePoint = CGPoint(
-                    x: cursor.location.x * context.sourceSize.width,
-                    y: (1 - cursor.location.y) * context.sourceSize.height
-                )
-                let cursorScale = context.scale * 2 * cursorCaptureScale / cursorImage.backingScale
+                let cursorScale = min(frameScaleX, frameScaleY) * 2 * cursorCaptureScale / cursorImage.backingScale
                 let cursorOrigin = CGPoint(
-                    x: context.targetRect.minX + sourcePoint.x * context.scale - cursorImage.hotSpot.x * cursorScale,
-                    y: context.targetRect.minY + sourcePoint.y * context.scale - (cursorImage.extent.height - cursorImage.hotSpot.y) * cursorScale
+                    x: context.targetRect.minX + cursor.location.x * context.targetRect.width - cursorImage.hotSpot.x * cursorScale,
+                    y: context.targetRect.minY + (1 - cursor.location.y) * context.targetRect.height - (cursorImage.extent.height - cursorImage.hotSpot.y) * cursorScale
                 )
                 let placedCursor = cursorImage.image
                     .transformed(by: CGAffineTransform(scaleX: cursorScale, y: cursorScale))
@@ -720,7 +702,6 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
 
     private func finishLiveWriting() async throws {
         guard let context = writingContext else { throw VideoRecordingError.couldNotProcess }
-        reportProgress(0.95)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             captureQueue.async {
                 if let failure = context.failure {
@@ -772,6 +753,37 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
     private func evenPixelDimension(_ value: CGFloat) -> Int {
         let roundedUp = max(2, Int(ceil(value)))
         return roundedUp + roundedUp % 2
+    }
+
+    private func frameContentRect(
+        from attachments: [SCStreamFrameInfo: Any],
+        pixelBuffer: CVPixelBuffer
+    ) -> CGRect {
+        let bufferExtent = CGRect(
+            x: 0,
+            y: 0,
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer)
+        )
+        guard let value = attachments[.contentRect] as? NSDictionary,
+              let reportedRect = CGRect(dictionaryRepresentation: value) else {
+            return bufferExtent
+        }
+
+        // ScreenCaptureKit can leave unused pixels at an output edge when its
+        // even-sized IOSurface does not exactly match the window. The metadata
+        // rect uses a top-left surface origin; Core Image uses bottom-left.
+        let minX = max(bufferExtent.minX, ceil(reportedRect.minX))
+        let maxX = min(bufferExtent.maxX, floor(reportedRect.maxX))
+        let minYFromTop = max(0, ceil(reportedRect.minY))
+        let maxYFromTop = min(bufferExtent.height, floor(reportedRect.maxY))
+        guard maxX > minX, maxYFromTop > minYFromTop else { return bufferExtent }
+        return CGRect(
+            x: minX,
+            y: bufferExtent.height - maxYFromTop,
+            width: maxX - minX,
+            height: maxYFromTop - minYFromTop
+        )
     }
 
 

@@ -1,85 +1,6 @@
 import AppKit
 import Carbon
 
-private final class RecordingProgressWindowController: NSWindowController {
-    private let progressIndicator = NSProgressIndicator()
-    private let statusLabel = NSTextField(labelWithString: "Finishing the MP4…")
-
-    init() {
-        let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 220),
-            styleMask: [.titled],
-            backing: .buffered,
-            defer: false
-        )
-        panel.title = "Finishing Your Video"
-        panel.isReleasedWhenClosed = false
-        panel.isMovableByWindowBackground = true
-        panel.standardWindowButton(.closeButton)?.isHidden = true
-        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
-        panel.standardWindowButton(.zoomButton)?.isHidden = true
-
-        let explanation = NSTextField(wrappingLabelWithString:
-            "NiceGrab applied your background, layout, corner text, and cursor while recording. It is now closing the MP4 and preparing it for the clipboard."
-        )
-        explanation.textColor = .labelColor
-
-        statusLabel.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
-        statusLabel.textColor = .secondaryLabelColor
-
-        progressIndicator.style = .bar
-        progressIndicator.isIndeterminate = false
-        progressIndicator.minValue = 0
-        progressIndicator.maxValue = 100
-
-        let note = NSTextField(wrappingLabelWithString: "This should only take a moment.")
-        note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        note.textColor = .tertiaryLabelColor
-
-        let stack = NSStackView(views: [explanation, statusLabel, progressIndicator, note])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 12
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        let contentView = NSView()
-        panel.contentView = contentView
-        contentView.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
-            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
-            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -24),
-            progressIndicator.widthAnchor.constraint(equalTo: stack.widthAnchor)
-        ])
-
-        super.init(window: panel)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    func present() {
-        window?.center()
-        showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    func update(progress: Double) {
-        let percent = max(0, min(100, progress * 100))
-        progressIndicator.doubleValue = percent
-        if percent < 90 {
-            statusLabel.stringValue = "Finishing the last frame…"
-        } else if percent < 99 {
-            statusLabel.stringValue = "Closing the MP4…"
-        } else {
-            statusLabel.stringValue = "Finishing the MP4…"
-        }
-    }
-}
-
 private final class StatusItemBackgroundDropView: NSView {
     var onDrop: ((URL) -> Bool)?
     private var isDragActive = false
@@ -217,7 +138,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recordingStartedAt: Date?
     private var processingSpinnerTimer: Timer?
     private var processingSpinnerAngle: CGFloat = 0
-    private var recordingProgressWindow: RecordingProgressWindowController?
     private let composer = ScreenshotComposer()
     private let backgroundStore = BackgroundStore()
     private let shortcutSettings = ShortcutSettings()
@@ -527,12 +447,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let recorder = videoRecorder as? VideoRecorder, recorder.isRecording {
             showProcessingStatus()
-            showRecordingProgress()
             Task {
                 do { try await recorder.stop() }
                 catch {
                     await MainActor.run {
-                        self.hideRecordingProgress()
                         self.rebuildMenu()
                         self.recordingFailed(error)
                     }
@@ -559,14 +477,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try await recorder.start(
                     includeMicrophone: useMicrophone,
                     smoothCursor: useSmoothCursor,
-                    style: style,
-                    progress: { [weak self] progress in
-                        self?.recordingProgressWindow?.update(progress: progress)
-                    }
+                    style: style
                 ) { [weak self] result in
                     guard let self else { return }
                     self.videoRecorder = nil
-                    self.hideRecordingProgress()
                     self.stopRecordingStatus()
                     self.rebuildMenu()
                     switch result {
@@ -587,7 +501,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await MainActor.run {
                     self.isStartingRecording = false
                     self.videoRecorder = nil
-                    self.hideRecordingProgress()
                     self.stopRecordingStatus()
                     self.rebuildMenu()
                     self.recordingFailed(error)
@@ -608,17 +521,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.writeObjects([url as NSURL])
-    }
-
-    private func showRecordingProgress() {
-        let controller = RecordingProgressWindowController()
-        recordingProgressWindow = controller
-        controller.present()
-    }
-
-    private func hideRecordingProgress() {
-        recordingProgressWindow?.close()
-        recordingProgressWindow = nil
     }
 
     @objc private func showHelp() {
