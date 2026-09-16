@@ -3,6 +3,7 @@ import AVFoundation
 import CoreImage
 import CoreMedia
 import CoreText
+import CoreVideo
 import QuartzCore
 import ScreenCaptureKit
 
@@ -27,17 +28,8 @@ enum VideoRecordingError: LocalizedError {
         case .couldNotStart:
             "The window recording could not be started."
         case .couldNotProcess:
-            "The finished recording could not be composited."
+            "The recording could not be encoded."
         }
-    }
-}
-
-struct VideoCompositionFallbackError: LocalizedError {
-    let originalURL: URL
-    let underlyingError: Error
-
-    var errorDescription: String? {
-        "NiceGrab couldn’t apply the final design: \(underlyingError.localizedDescription)\n\nThe original, unstyled recording was preserved and copied to the clipboard."
     }
 }
 
@@ -54,31 +46,6 @@ private struct CursorSample: @unchecked Sendable {
     let isInside: Bool
     let cursor: NSCursor?
 
-    static func sample(at time: TimeInterval, in samples: [CursorSample]) -> CursorSample? {
-        guard !samples.isEmpty else { return nil }
-        var low = 0
-        var high = samples.count
-        while low < high {
-            let middle = (low + high) / 2
-            if samples[middle].time < time { low = middle + 1 } else { high = middle }
-        }
-        if low == 0 { return samples[0] }
-        if low == samples.count { return samples[samples.count - 1] }
-        let before = samples[low - 1]
-        let after = samples[low]
-        let duration = after.time - before.time
-        guard duration > 0 else { return after }
-        let amount = CGFloat((time - before.time) / duration)
-        return CursorSample(
-            time: time,
-            location: CGPoint(
-                x: before.location.x + (after.location.x - before.location.x) * amount,
-                y: before.location.y + (after.location.y - before.location.y) * amount
-            ),
-            isInside: amount < 0.5 ? before.isInside : after.isInside,
-            cursor: amount < 0.5 ? before.cursor : after.cursor
-        )
-    }
 }
 
 private struct CursorImage {
@@ -88,41 +55,66 @@ private struct CursorImage {
     let backingScale: CGFloat
 }
 
-private final class MP4WritingContext: @unchecked Sendable {
-    let reader: AVAssetReader
+// All mutable state is confined to VideoRecorder.captureQueue. Only the latest
+// ScreenCaptureKit pixel buffer is retained, so memory use does not grow with
+// recording duration.
+private final class LiveWritingContext: @unchecked Sendable {
     let writer: AVAssetWriter
-    let videoOutput: AVAssetReaderVideoCompositionOutput
     let videoInput: AVAssetWriterInput
-    let audioOutput: AVAssetReaderAudioMixOutput?
-    let audioInput: AVAssetWriterInput?
-    let progressHandler: (Double) -> Void
-    private let progressLock = NSLock()
-    private var lastProgressStep = -1
+    let pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor
+    let systemAudioInput: AVAssetWriterInput
+    let microphoneInput: AVAssetWriterInput?
+    let ciContext: CIContext
+    let colorSpace: CGColorSpace
+    let sourceSize: CGSize
+    let canvasSize: CGSize
+    let canvasExtent: CGRect
+    let targetRect: CGRect
+    let scale: CGFloat
+    let mask: CIImage
+    let shadow: CIImage
+    let background: CIImage
+    let overlay: CIImage?
+    var latestSourcePixelBuffer: CVPixelBuffer?
+    var sessionStartPTS: CMTime?
+    var lastVideoFrameIndex: Int64 = -1
+    var lastVideoPTS: CMTime?
+    var cursorImages: [ObjectIdentifier: CursorImage] = [:]
+    var failure: Error?
 
     init(
-        reader: AVAssetReader,
         writer: AVAssetWriter,
-        videoOutput: AVAssetReaderVideoCompositionOutput,
         videoInput: AVAssetWriterInput,
-        audioOutput: AVAssetReaderAudioMixOutput?,
-        audioInput: AVAssetWriterInput?,
-        progressHandler: @escaping (Double) -> Void
+        pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor,
+        systemAudioInput: AVAssetWriterInput,
+        microphoneInput: AVAssetWriterInput?,
+        ciContext: CIContext,
+        colorSpace: CGColorSpace,
+        sourceSize: CGSize,
+        canvasSize: CGSize,
+        targetRect: CGRect,
+        scale: CGFloat,
+        mask: CIImage,
+        shadow: CIImage,
+        background: CIImage,
+        overlay: CIImage?
     ) {
-        self.reader = reader
         self.writer = writer
-        self.videoOutput = videoOutput
         self.videoInput = videoInput
-        self.audioOutput = audioOutput
-        self.audioInput = audioInput
-        self.progressHandler = progressHandler
-    }
-
-    func claimProgressStep(_ step: Int) -> Bool {
-        progressLock.lock()
-        defer { progressLock.unlock() }
-        guard step > lastProgressStep else { return false }
-        lastProgressStep = step
-        return true
+        self.pixelBufferAdaptor = pixelBufferAdaptor
+        self.systemAudioInput = systemAudioInput
+        self.microphoneInput = microphoneInput
+        self.ciContext = ciContext
+        self.colorSpace = colorSpace
+        self.sourceSize = sourceSize
+        self.canvasSize = canvasSize
+        self.canvasExtent = CGRect(origin: .zero, size: canvasSize)
+        self.targetRect = targetRect
+        self.scale = scale
+        self.mask = mask
+        self.shadow = shadow
+        self.background = background
+        self.overlay = overlay
     }
 }
 
@@ -175,7 +167,8 @@ private final class CursorTracker {
     private var displayLink: CADisplayLink?
     private var globalMonitor: Any?
     private var localMonitor: Any?
-    private var samples: [CursorSample] = []
+    private let sampleLock = NSLock()
+    private var latestSample: CursorSample?
     private var latestPoint: CGPoint = .zero
     private var latestCursor: NSCursor?
     private var xFilter = OneEuroFilter(minimumCutoff: 1, beta: 0.001, derivativeCutoff: 0.8)
@@ -206,15 +199,19 @@ private final class CursorTracker {
         self.displayLink = displayLink
     }
 
-    @discardableResult
-    func stop() -> [CursorSample] {
+    func stop() {
         displayLink?.invalidate()
         displayLink = nil
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
         globalMonitor = nil
         localMonitor = nil
-        return samples
+    }
+
+    func currentSample() -> CursorSample? {
+        sampleLock.lock()
+        defer { sampleLock.unlock() }
+        return latestSample
     }
 
     @objc private func displayDidRefresh() {
@@ -244,7 +241,9 @@ private final class CursorTracker {
             isInside: windowFrame.contains(point),
             cursor: latestCursor
         )
-        samples.append(sample)
+        sampleLock.lock()
+        latestSample = sample
+        sampleLock.unlock()
     }
 
     private func refreshWindowFrame(at time: TimeInterval) {
@@ -263,28 +262,21 @@ private final class CursorTracker {
 }
 
 @available(macOS 15.0, *)
-final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate, SCStreamOutput {
+final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
     typealias Completion = (Result<URL, Error>) -> Void
     typealias ProgressHandler = @MainActor (Double) -> Void
 
     private let ownPID = ProcessInfo.processInfo.processIdentifier
     private var stream: SCStream?
-    private var recordingOutput: SCRecordingOutput?
-    private var rawURL: URL?
     private var finalURL: URL?
-    private var style: VideoCompositionStyle?
+    private var writingContext: LiveWritingContext?
     private var completion: Completion?
     private var progressHandler: ProgressHandler?
     private var isStopping = false
     private var cursorTracker: CursorTracker?
-    private var cursorSamples: [CursorSample] = []
     private var cursorCaptureScale: CGFloat = 2
-    private let frameTimingQueue = DispatchQueue(label: "NiceGrab.FrameTiming", qos: .userInteractive)
-    private let audioSinkQueue = DispatchQueue(label: "NiceGrab.AudioSink", qos: .userInitiated)
-    private let microphoneSinkQueue = DispatchQueue(label: "NiceGrab.MicrophoneSink", qos: .userInitiated)
-    private let frameTimingLock = NSLock()
-    private var firstFramePTS: TimeInterval?
-    private var minimumHostMinusPTS: TimeInterval?
+    private let captureQueue = DispatchQueue(label: "NiceGrab.LiveComposition", qos: .userInteractive)
+    private var frameTimer: DispatchSourceTimer?
 
     var isRecording: Bool { stream != nil }
     var isFinishing: Bool { isStopping }
@@ -322,9 +314,8 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         let configuration = SCStreamConfiguration()
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         cursorCaptureScale = scale
-        // SCRecordingOutput encodes H.264 using 4:2:0 chroma subsampling, which
-        // requires even pixel dimensions. Window frames can contain half-point
-        // sizes, so their scaled pixel dimensions are occasionally odd.
+        // The live H.264 writer uses 4:2:0 chroma subsampling, which requires
+        // even pixel dimensions. Window frames can contain half-point sizes.
         configuration.width = evenPixelDimension(window.frame.width * scale)
         configuration.height = evenPixelDimension(window.frame.height * scale)
         // Preserve fluid pointer and window motion at 60 fps.
@@ -343,27 +334,26 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         configuration.channelCount = 2
         configuration.captureMicrophone = includeMicrophone
 
-        let urls = try recordingURLs()
-        let outputConfiguration = SCRecordingOutputConfiguration()
-        outputConfiguration.outputURL = urls.raw
-        outputConfiguration.outputFileType = .mp4
-        outputConfiguration.videoCodecType = .h264
+        let outputURL = try recordingURL()
+        let sourceSize = CGSize(width: configuration.width, height: configuration.height)
+        let context = try makeLiveWritingContext(
+            outputURL: outputURL,
+            sourceSize: sourceSize,
+            style: style,
+            includeMicrophone: includeMicrophone
+        )
 
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
-        let output = SCRecordingOutput(configuration: outputConfiguration, delegate: self)
-        try stream.addRecordingOutput(output)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: frameTimingQueue)
-        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioSinkQueue)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
+        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: captureQueue)
         if includeMicrophone {
-            try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: microphoneSinkQueue)
+            try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: captureQueue)
         }
 
         self.stream = stream
-        self.recordingOutput = output
-        self.rawURL = urls.raw
-        self.finalURL = urls.final
-        self.style = style
+        self.finalURL = outputURL
+        self.writingContext = context
         self.progressHandler = progress
         self.completion = completion
         self.isStopping = false
@@ -375,8 +365,13 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         }
 
         do {
+            guard context.writer.startWriting() else {
+                throw context.writer.error ?? VideoRecordingError.couldNotStart
+            }
             try await stream.startCapture()
+            startFrameTimer()
         } catch {
+            context.writer.cancelWriting()
             reset(removeFiles: true)
             throw error
         }
@@ -385,63 +380,50 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
     func stop() async throws {
         guard let stream, !isStopping else { return }
         isStopping = true
-        reportProgress(0.02)
-        cursorSamples = cursorTracker?.stop() ?? []
+        reportProgress(0.85)
+        frameTimer?.cancel()
+        frameTimer = nil
+        cursorTracker?.stop()
         cursorTracker = nil
-        try await stream.stopCapture()
+        do {
+            try await stream.stopCapture()
+            try await finishLiveWriting()
+            reportProgress(1)
+            guard let finalURL else { throw VideoRecordingError.couldNotProcess }
+            finish(.success(finalURL), removeFiles: false)
+        } catch {
+            writingContext?.writer.cancelWriting()
+            finish(.failure(error))
+        }
     }
-
-    func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {}
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
-        guard outputType == .screen, sampleBuffer.isValid else { return }
-        let pts = sampleBuffer.presentationTimeStamp.seconds
-        guard pts.isFinite else { return }
-        let hostTime = ProcessInfo.processInfo.systemUptime
-        frameTimingLock.lock()
-        if firstFramePTS == nil { firstFramePTS = pts }
-        let hostMinusPTS = hostTime - pts
-        minimumHostMinusPTS = min(minimumHostMinusPTS ?? hostMinusPTS, hostMinusPTS)
-        frameTimingLock.unlock()
-    }
-
-    func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: Error) {
-        finish(.failure(error))
-    }
-
-    func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
-        guard let rawURL, let finalURL, let style else {
-            finish(.failure(VideoRecordingError.couldNotProcess))
+        guard sampleBuffer.isValid, let context = writingContext, context.failure == nil else { return }
+        switch outputType {
+        case .screen:
+            receiveScreenFrame(sampleBuffer, context: context)
+        case .audio:
+            appendAudio(sampleBuffer, to: context.systemAudioInput, context: context)
+        case .microphone:
+            guard let microphoneInput = context.microphoneInput else { return }
+            appendAudio(sampleBuffer, to: microphoneInput, context: context)
+        @unknown default:
             return
-        }
-        reportProgress(0.05)
-        Task {
-            do {
-                let samples = cursorTracker?.stop() ?? cursorSamples
-                cursorTracker = nil
-                let videoTimedSamples = cursorSamplesOnVideoTimeline(samples)
-                reportProgress(0.08)
-                try await compositeRecording(
-                    from: rawURL,
-                    to: finalURL,
-                    style: style,
-                    cursorSamples: videoTimedSamples,
-                    cursorCaptureScale: cursorCaptureScale
-                )
-                try? FileManager.default.removeItem(at: rawURL)
-                finish(.success(finalURL), removeFiles: false)
-            } catch {
-                let fallbackURL = preserveOriginalRecording(from: rawURL, at: finalURL)
-                finish(.failure(VideoCompositionFallbackError(
-                    originalURL: fallbackURL,
-                    underlyingError: error
-                )), removeFiles: false)
-            }
         }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        finish(.failure(error))
+        guard !isStopping else { return }
+        isStopping = true
+        frameTimer?.cancel()
+        frameTimer = nil
+        cursorTracker?.stop()
+        cursorTracker = nil
+        captureQueue.async { [weak self] in
+            guard let self else { return }
+            self.writingContext?.writer.cancelWriting()
+            self.finish(.failure(error))
+        }
     }
 
     private func finish(_ result: Result<URL, Error>, removeFiles: Bool = true) {
@@ -453,25 +435,19 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
 
     private func reset(removeFiles: Bool) {
         if removeFiles {
-            if let rawURL { try? FileManager.default.removeItem(at: rawURL) }
             if let finalURL { try? FileManager.default.removeItem(at: finalURL) }
         }
+        frameTimer?.cancel()
+        frameTimer = nil
         stream = nil
-        recordingOutput = nil
-        rawURL = nil
         finalURL = nil
-        style = nil
+        writingContext = nil
         completion = nil
         progressHandler = nil
         isStopping = false
         cursorTracker?.stop()
         cursorTracker = nil
-        cursorSamples = []
         cursorCaptureScale = 2
-        frameTimingLock.lock()
-        firstFramePTS = nil
-        minimumHostMinusPTS = nil
-        frameTimingLock.unlock()
     }
 
     private func reportProgress(_ progress: Double) {
@@ -482,60 +458,7 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         }
     }
 
-    private func preserveOriginalRecording(from rawURL: URL, at preferredURL: URL) -> URL {
-        try? FileManager.default.removeItem(at: preferredURL)
-        do {
-            try FileManager.default.moveItem(at: rawURL, to: preferredURL)
-            return preferredURL
-        } catch {
-            return rawURL
-        }
-    }
-
-    private func cursorSamplesOnVideoTimeline(_ samples: [CursorSample]) -> [CursorSample] {
-        guard !samples.isEmpty else { return [] }
-        frameTimingLock.lock()
-        let firstPTS = firstFramePTS
-        let hostMinusPTS = minimumHostMinusPTS
-        frameTimingLock.unlock()
-
-        let firstVideoFrameHostTime: TimeInterval
-        if let firstPTS, let hostMinusPTS {
-            firstVideoFrameHostTime = firstPTS + hostMinusPTS
-        } else {
-            firstVideoFrameHostTime = samples[0].time
-        }
-        return samples.map {
-            CursorSample(
-                time: $0.time - firstVideoFrameHostTime,
-                location: $0.location,
-                isInside: $0.isInside,
-                cursor: $0.cursor
-            )
-        }
-    }
-
-    private func frontWindowID() -> CGWindowID? {
-        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
-        for window in windows {
-            guard let layer = window[kCGWindowLayer as String] as? Int, layer == 0,
-                  let pid = window[kCGWindowOwnerPID as String] as? Int, pid != ownPID,
-                  let alpha = window[kCGWindowAlpha as String] as? Double, alpha > 0,
-                  let bounds = window[kCGWindowBounds as String] as? [String: Any],
-                  let width = bounds["Width"] as? CGFloat, let height = bounds["Height"] as? CGFloat,
-                  width > 120, height > 80,
-                  let number = window[kCGWindowNumber as String] as? UInt32 else { continue }
-            return CGWindowID(number)
-        }
-        return nil
-    }
-
-    private func evenPixelDimension(_ value: CGFloat) -> Int {
-        let roundedUp = max(2, Int(ceil(value)))
-        return roundedUp + roundedUp % 2
-    }
-
-    private func recordingURLs() throws -> (raw: URL, final: URL) {
+    private func recordingURL() throws -> URL {
         let root = try FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -545,43 +468,28 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let name = "NiceGrab \(formatter.string(from: Date()))"
-        return (
-            root.appendingPathComponent(".\(name)-raw.mp4"),
-            root.appendingPathComponent("\(name).mp4")
-        )
+        return root.appendingPathComponent("NiceGrab \(formatter.string(from: Date())).mp4")
     }
 
-    private func compositeRecording(
-        from sourceURL: URL,
-        to outputURL: URL,
+    private func makeLiveWritingContext(
+        outputURL: URL,
+        sourceSize: CGSize,
         style: VideoCompositionStyle,
-        cursorSamples: [CursorSample],
-        cursorCaptureScale: CGFloat
-    ) async throws {
-        let asset = AVURLAsset(url: sourceURL)
-        guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
-            throw VideoRecordingError.couldNotProcess
-        }
-        let duration = try await asset.load(.duration).seconds
-        let naturalSize = try await videoTrack.load(.naturalSize)
-        let requestedCanvasSize = style.canvas.size(for: naturalSize, padding: style.padding)
-        // 4:2:0 H.264 needs even dimensions. Adaptive canvases inherit the
-        // captured window's pixel size, which can occasionally be odd.
+        includeMicrophone: Bool
+    ) throws -> LiveWritingContext {
+        try? FileManager.default.removeItem(at: outputURL)
+        let requestedCanvasSize = style.canvas.size(for: sourceSize, padding: style.padding)
         let canvasSize = CGSize(
             width: ceil(requestedCanvasSize.width / 2) * 2,
             height: ceil(requestedCanvasSize.height / 2) * 2
         )
         let canvasExtent = CGRect(origin: .zero, size: canvasSize)
-        let background = makeBackground(style.background, extent: canvasExtent)
-        let overlay = makeCornerText(style.cornerText, extent: canvasExtent)
-
         let maximumSize = CGSize(
-            width: canvasSize.width - style.padding * 2,
-            height: canvasSize.height - style.padding * 2
+            width: max(2, canvasSize.width - style.padding * 2),
+            height: max(2, canvasSize.height - style.padding * 2)
         )
-        let scale = min(1, maximumSize.width / naturalSize.width, maximumSize.height / naturalSize.height)
-        let targetSize = CGSize(width: naturalSize.width * scale, height: naturalSize.height * scale)
+        let scale = min(1, maximumSize.width / sourceSize.width, maximumSize.height / sourceSize.height)
+        let targetSize = CGSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
         let targetRect = CGRect(
             x: (canvasSize.width - targetSize.width) / 2,
             y: (canvasSize.height - targetSize.height) / 2,
@@ -593,105 +501,11 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
             targetSize.width / 20,
             targetSize.height / 20
         )
-        let mask = makeRoundedMask(rect: targetRect, canvasExtent: canvasExtent, radius: radius)
-        let windowShadow = makeWindowShadow(rect: targetRect, canvasExtent: canvasExtent, radius: radius)
-        var cursorImages: [ObjectIdentifier: CursorImage] = [:]
-        for sample in cursorSamples {
-            guard let cursor = sample.cursor else { continue }
-            let identifier = ObjectIdentifier(cursor)
-            if cursorImages[identifier] == nil {
-                cursorImages[identifier] = makeCursorImage(cursor)
-            }
-        }
-
-        let composition = AVMutableVideoComposition(asset: asset) { request in
-            let source = request.sourceImage.clampedToExtent().cropped(to: request.sourceImage.extent)
-            let transform = CGAffineTransform(translationX: -source.extent.minX, y: -source.extent.minY)
-                .scaledBy(x: scale, y: scale)
-                .translatedBy(x: targetRect.minX / scale, y: targetRect.minY / scale)
-            let framed = source.transformed(by: transform)
-            var framedWithCursor = framed
-            if let cursor = CursorSample.sample(at: request.compositionTime.seconds, in: cursorSamples),
-               cursor.isInside,
-               let systemCursor = cursor.cursor,
-               let cursorImage = cursorImages[ObjectIdentifier(systemCursor)] {
-                let sourcePoint = CGPoint(
-                    x: cursor.location.x * naturalSize.width,
-                    y: (1 - cursor.location.y) * naturalSize.height
-                )
-                // The cursor is rasterized at 8x to keep the requested 2x display
-                // size crisp, even after the window is scaled into the canvas.
-                let cursorScale = scale * 2 * cursorCaptureScale / cursorImage.backingScale
-                let cursorOrigin = CGPoint(
-                    x: targetRect.minX + sourcePoint.x * scale - cursorImage.hotSpot.x * cursorScale,
-                    y: targetRect.minY + sourcePoint.y * scale - (cursorImage.extent.height - cursorImage.hotSpot.y) * cursorScale
-                )
-                let placedCursor = cursorImage.image
-                    .transformed(by: CGAffineTransform(scaleX: cursorScale, y: cursorScale))
-                    .transformed(by: CGAffineTransform(translationX: cursorOrigin.x, y: cursorOrigin.y))
-                framedWithCursor = placedCursor.composited(over: framed)
-            }
-            let transparentCanvas = CIImage(color: .clear).cropped(to: canvasExtent)
-            let roundedWindow = framedWithCursor.applyingFilter("CIBlendWithAlphaMask", parameters: [
-                kCIInputBackgroundImageKey: transparentCanvas,
-                kCIInputMaskImageKey: mask
-            ])
-            let framedWithShadow = roundedWindow.composited(over: windowShadow)
-            var result = framedWithShadow.composited(over: background)
-            if let overlay { result = overlay.composited(over: result) }
-            request.finish(with: result.cropped(to: canvasExtent), context: nil)
-        }
-        composition.renderSize = canvasSize
-        composition.frameDuration = CMTime(value: 1, timescale: 60)
-        if !cursorSamples.isEmpty {
-            // ScreenCaptureKit may encode a variable-frame-rate track and omit
-            // samples while only the separately monitored cursor is moving.
-            // Synthetic-cursor recordings therefore need an independent 60-fps
-            // output clock. Native-cursor recordings can preserve sparse source
-            // timing, avoiding needless frame rendering and a slower export.
-            composition.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
-        }
-
-        try await writeCompatibleMP4(
-            asset: asset,
-            videoTrack: videoTrack,
-            videoComposition: composition,
-            canvasSize: canvasSize,
-            duration: duration,
-            outputURL: outputURL
-        )
-    }
-
-    private func writeCompatibleMP4(
-        asset: AVAsset,
-        videoTrack: AVAssetTrack,
-        videoComposition: AVVideoComposition,
-        canvasSize: CGSize,
-        duration: TimeInterval,
-        outputURL: URL
-    ) async throws {
-        let reader = try AVAssetReader(asset: asset)
-        let videoOutput = AVAssetReaderVideoCompositionOutput(
-            videoTracks: [videoTrack],
-            videoSettings: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-            ]
-        )
-        videoOutput.videoComposition = videoComposition
-        videoOutput.alwaysCopiesSampleData = false
-        guard reader.canAdd(videoOutput) else { throw VideoRecordingError.couldNotProcess }
-        reader.add(videoOutput)
 
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-        // Put the movie index before media data so chat clients can inspect and
-        // generate a preview without first downloading the whole recording.
         writer.shouldOptimizeForNetworkUse = true
-
         let width = Int(canvasSize.width.rounded())
         let height = Int(canvasSize.height.rounded())
-        // Screen recordings contain large static regions and compress well.
-        // Target about 1 Mbps at 1080p60, scaling with pixel count while
-        // retaining enough headroom for scrolling and other window motion.
         let bitsPerSecond = min(
             5_000_000,
             max(500_000, Int(Double(width * height * 60) * 0.008))
@@ -717,20 +531,21 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
                 ]
             ]
         )
-        videoInput.expectsMediaDataInRealTime = false
-        guard writer.canAdd(videoInput) else { throw VideoRecordingError.couldNotProcess }
-        // Adding video first makes it track 1. Some chat preview pipelines do
-        // not reliably discover video when an audio track comes first.
+        videoInput.expectsMediaDataInRealTime = true
+        guard writer.canAdd(videoInput) else { throw VideoRecordingError.couldNotStart }
         writer.add(videoInput)
+        let pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ]
+        )
 
-        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
-        var audioOutput: AVAssetReaderAudioMixOutput?
-        var audioInput: AVAssetWriterInput?
-        if !audioTracks.isEmpty {
-            let output = AVAssetReaderAudioMixOutput(
-                audioTracks: audioTracks,
-                audioSettings: [AVFormatIDKey: kAudioFormatLinearPCM]
-            )
+        func makeAudioInput() -> AVAssetWriterInput {
             let input = AVAssetWriterInput(
                 mediaType: .audio,
                 outputSettings: [
@@ -740,101 +555,225 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
                     AVEncoderBitRateKey: 128_000
                 ]
             )
-            input.expectsMediaDataInRealTime = false
-            guard reader.canAdd(output), writer.canAdd(input) else {
-                throw VideoRecordingError.couldNotProcess
-            }
-            reader.add(output)
+            input.expectsMediaDataInRealTime = true
+            return input
+        }
+
+        let systemAudioInput = makeAudioInput()
+        guard writer.canAdd(systemAudioInput) else { throw VideoRecordingError.couldNotStart }
+        writer.add(systemAudioInput)
+        var microphoneInput: AVAssetWriterInput?
+        if includeMicrophone {
+            // Keep microphone samples on their own simultaneous track for this
+            // prototype, matching QuickScreen's real-time writer architecture.
+            let input = makeAudioInput()
+            guard writer.canAdd(input) else { throw VideoRecordingError.couldNotStart }
             writer.add(input)
-            audioOutput = output
-            audioInput = input
+            microphoneInput = input
         }
 
-        guard writer.startWriting() else {
-            throw writer.error ?? VideoRecordingError.couldNotProcess
-        }
-        writer.startSession(atSourceTime: .zero)
-        guard reader.startReading() else {
-            writer.cancelWriting()
-            throw reader.error ?? VideoRecordingError.couldNotProcess
-        }
-
-        let context = MP4WritingContext(
-            reader: reader,
+        return LiveWritingContext(
             writer: writer,
-            videoOutput: videoOutput,
             videoInput: videoInput,
-            audioOutput: audioOutput,
-            audioInput: audioInput,
-            progressHandler: { [weak self] progress in
-                self?.reportProgress(progress)
+            pixelBufferAdaptor: pixelBufferAdaptor,
+            systemAudioInput: systemAudioInput,
+            microphoneInput: microphoneInput,
+            ciContext: CIContext(),
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            sourceSize: sourceSize,
+            canvasSize: canvasSize,
+            targetRect: targetRect,
+            scale: scale,
+            mask: makeRoundedMask(rect: targetRect, canvasExtent: canvasExtent, radius: radius),
+            shadow: makeWindowShadow(rect: targetRect, canvasExtent: canvasExtent, radius: radius),
+            background: makeBackground(style.background, extent: canvasExtent),
+            overlay: makeCornerText(style.cornerText, extent: canvasExtent)
+        )
+    }
+
+    private func startFrameTimer() {
+        // ScreenCaptureKit can omit source frames while only a separately drawn
+        // cursor moves. A writer-owned 60 Hz clock keeps that motion fluid while
+        // reusing the latest source buffer for otherwise static content.
+        let timer = DispatchSource.makeTimerSource(queue: captureQueue)
+        timer.schedule(deadline: .now(), repeating: 1.0 / 60.0, leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self, let context = self.writingContext else { return }
+            self.appendLiveVideoFrame(context: context, hostTime: CMClockGetTime(CMClockGetHostTimeClock()))
+        }
+        frameTimer = timer
+        timer.resume()
+    }
+
+    private func receiveScreenFrame(_ sampleBuffer: CMSampleBuffer, context: LiveWritingContext) {
+        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer,
+            createIfNecessary: false
+        ) as? [[SCStreamFrameInfo: Any]],
+              let attachments = attachmentsArray.first,
+              let statusRawValue = attachments[.status] as? Int,
+              let status = SCFrameStatus(rawValue: statusRawValue),
+              status == .complete,
+              let pixelBuffer = sampleBuffer.imageBuffer else { return }
+
+        context.latestSourcePixelBuffer = pixelBuffer
+        if context.sessionStartPTS == nil {
+            let startPTS = sampleBuffer.presentationTimeStamp
+            context.writer.startSession(atSourceTime: startPTS)
+            context.sessionStartPTS = startPTS
+            appendLiveVideoFrame(context: context, hostTime: startPTS)
+        }
+    }
+
+    private func appendLiveVideoFrame(context: LiveWritingContext, hostTime: CMTime) {
+        guard context.failure == nil,
+              let startPTS = context.sessionStartPTS,
+              let sourcePixelBuffer = context.latestSourcePixelBuffer,
+              hostTime >= startPTS else { return }
+        let elapsed = CMTimeSubtract(hostTime, startPTS).seconds
+        guard elapsed.isFinite else { return }
+        let frameIndex = max(0, Int64(floor(elapsed * 60)))
+        guard frameIndex > context.lastVideoFrameIndex, context.videoInput.isReadyForMoreMediaData else { return }
+        guard let pool = context.pixelBufferAdaptor.pixelBufferPool else {
+            context.failure = VideoRecordingError.couldNotProcess
+            return
+        }
+        var destinationPixelBuffer: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &destinationPixelBuffer) == kCVReturnSuccess,
+              let destinationPixelBuffer else {
+            context.failure = VideoRecordingError.couldNotProcess
+            return
+        }
+
+        let source = CIImage(cvPixelBuffer: sourcePixelBuffer)
+            .cropped(to: CGRect(origin: .zero, size: context.sourceSize))
+        let transform = CGAffineTransform(translationX: -source.extent.minX, y: -source.extent.minY)
+            .scaledBy(x: context.scale, y: context.scale)
+            .translatedBy(x: context.targetRect.minX / context.scale, y: context.targetRect.minY / context.scale)
+        var framed = source.transformed(by: transform)
+        if let cursor = cursorTracker?.currentSample(),
+           cursor.isInside,
+           let systemCursor = cursor.cursor {
+            let identifier = ObjectIdentifier(systemCursor)
+            let cursorImage: CursorImage?
+            if let cached = context.cursorImages[identifier] {
+                cursorImage = cached
+            } else {
+                cursorImage = makeCursorImage(systemCursor)
+                context.cursorImages[identifier] = cursorImage
             }
+            if let cursorImage {
+                let sourcePoint = CGPoint(
+                    x: cursor.location.x * context.sourceSize.width,
+                    y: (1 - cursor.location.y) * context.sourceSize.height
+                )
+                let cursorScale = context.scale * 2 * cursorCaptureScale / cursorImage.backingScale
+                let cursorOrigin = CGPoint(
+                    x: context.targetRect.minX + sourcePoint.x * context.scale - cursorImage.hotSpot.x * cursorScale,
+                    y: context.targetRect.minY + sourcePoint.y * context.scale - (cursorImage.extent.height - cursorImage.hotSpot.y) * cursorScale
+                )
+                let placedCursor = cursorImage.image
+                    .transformed(by: CGAffineTransform(scaleX: cursorScale, y: cursorScale))
+                    .transformed(by: CGAffineTransform(translationX: cursorOrigin.x, y: cursorOrigin.y))
+                framed = placedCursor.composited(over: framed)
+            }
+        }
+
+        let transparentCanvas = CIImage(color: .clear).cropped(to: context.canvasExtent)
+        let roundedWindow = framed.applyingFilter("CIBlendWithAlphaMask", parameters: [
+            kCIInputBackgroundImageKey: transparentCanvas,
+            kCIInputMaskImageKey: context.mask
+        ])
+        let framedWithShadow = roundedWindow.composited(over: context.shadow)
+        var result = framedWithShadow.composited(over: context.background)
+        if let overlay = context.overlay { result = overlay.composited(over: result) }
+        context.ciContext.render(
+            result.cropped(to: context.canvasExtent),
+            to: destinationPixelBuffer,
+            bounds: context.canvasExtent,
+            colorSpace: context.colorSpace
         )
 
+        let presentationTime = CMTimeAdd(startPTS, CMTime(value: frameIndex, timescale: 60))
+        guard context.pixelBufferAdaptor.append(destinationPixelBuffer, withPresentationTime: presentationTime) else {
+            context.failure = context.writer.error ?? VideoRecordingError.couldNotProcess
+            return
+        }
+        context.lastVideoFrameIndex = frameIndex
+        context.lastVideoPTS = presentationTime
+    }
+
+    private func appendAudio(
+        _ sampleBuffer: CMSampleBuffer,
+        to input: AVAssetWriterInput,
+        context: LiveWritingContext
+    ) {
+        guard context.failure == nil,
+              let startPTS = context.sessionStartPTS,
+              sampleBuffer.presentationTimeStamp >= startPTS,
+              input.isReadyForMoreMediaData else { return }
+        guard input.append(sampleBuffer) else {
+            context.failure = context.writer.error ?? VideoRecordingError.couldNotProcess
+            return
+        }
+    }
+
+    private func finishLiveWriting() async throws {
+        guard let context = writingContext else { throw VideoRecordingError.couldNotProcess }
+        reportProgress(0.95)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let group = DispatchGroup()
-            let videoQueue = DispatchQueue(label: "NiceGrab.VideoEncoder", qos: .userInitiated)
-            group.enter()
-            context.videoInput.requestMediaDataWhenReady(on: videoQueue) {
-                while context.videoInput.isReadyForMoreMediaData {
-                    guard let sample = context.videoOutput.copyNextSampleBuffer() else {
-                        context.videoInput.markAsFinished()
-                        group.leave()
-                        return
-                    }
-                    guard context.videoInput.append(sample) else {
-                        context.reader.cancelReading()
-                        context.videoInput.markAsFinished()
-                        group.leave()
-                        return
-                    }
-                    let timelineProgress = sample.presentationTimeStamp.seconds / max(0.001, duration)
-                    let progress = 0.08 + max(0, min(1, timelineProgress)) * 0.88
-                    if context.claimProgressStep(Int(progress * 100)) {
-                        context.progressHandler(progress)
-                    }
+            captureQueue.async {
+                if let failure = context.failure {
+                    context.writer.cancelWriting()
+                    continuation.resume(throwing: failure)
+                    return
                 }
-            }
-
-            if let audioInput = context.audioInput {
-                let audioQueue = DispatchQueue(label: "NiceGrab.AudioEncoder", qos: .userInitiated)
-                group.enter()
-                audioInput.requestMediaDataWhenReady(on: audioQueue) {
-                    guard let contextAudioInput = context.audioInput,
-                          let contextAudioOutput = context.audioOutput else {
-                        group.leave()
-                        return
-                    }
-                    while contextAudioInput.isReadyForMoreMediaData {
-                        guard let sample = contextAudioOutput.copyNextSampleBuffer() else {
-                            contextAudioInput.markAsFinished()
-                            group.leave()
-                            return
-                        }
-                        guard contextAudioInput.append(sample) else {
-                            context.reader.cancelReading()
-                            contextAudioInput.markAsFinished()
-                            group.leave()
-                            return
-                        }
-                    }
+                guard context.sessionStartPTS != nil, context.lastVideoPTS != nil else {
+                    context.writer.cancelWriting()
+                    continuation.resume(throwing: VideoRecordingError.couldNotStart)
+                    return
                 }
-            }
-
-            group.notify(queue: DispatchQueue.global(qos: .userInitiated)) {
+                context.videoInput.markAsFinished()
+                context.systemAudioInput.markAsFinished()
+                context.microphoneInput?.markAsFinished()
                 context.writer.finishWriting {
                     if context.writer.status == .completed {
-                        context.progressHandler(1)
                         continuation.resume()
                     } else {
                         continuation.resume(
-                            throwing: context.writer.error ?? context.reader.error ?? VideoRecordingError.couldNotProcess
+                            throwing: context.writer.error ?? VideoRecordingError.couldNotProcess
                         )
                     }
                 }
             }
         }
     }
+
+    private func frontWindowID() -> CGWindowID? {
+        guard let windows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else { return nil }
+        for window in windows {
+            guard let layer = window[kCGWindowLayer as String] as? Int, layer == 0,
+                  let pid = window[kCGWindowOwnerPID as String] as? Int, pid != ownPID,
+                  let alpha = window[kCGWindowAlpha as String] as? Double, alpha > 0,
+                  let bounds = window[kCGWindowBounds as String] as? [String: Any],
+                  let width = bounds["Width"] as? CGFloat,
+                  let height = bounds["Height"] as? CGFloat,
+                  width > 120,
+                  height > 80,
+                  let number = window[kCGWindowNumber as String] as? UInt32 else { continue }
+            return CGWindowID(number)
+        }
+        return nil
+    }
+
+    private func evenPixelDimension(_ value: CGFloat) -> Int {
+        let roundedUp = max(2, Int(ceil(value)))
+        return roundedUp + roundedUp % 2
+    }
+
 
     private func makeCursorImage(_ cursor: NSCursor) -> CursorImage? {
         let backingScale: CGFloat = 8

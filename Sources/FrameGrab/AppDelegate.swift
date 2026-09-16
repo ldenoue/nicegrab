@@ -3,7 +3,7 @@ import Carbon
 
 private final class RecordingProgressWindowController: NSWindowController {
     private let progressIndicator = NSProgressIndicator()
-    private let statusLabel = NSTextField(labelWithString: "Finalizing the recording…")
+    private let statusLabel = NSTextField(labelWithString: "Finishing the MP4…")
 
     init() {
         let panel = NSPanel(
@@ -12,7 +12,7 @@ private final class RecordingProgressWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        panel.title = "Preparing Your Video"
+        panel.title = "Finishing Your Video"
         panel.isReleasedWhenClosed = false
         panel.isMovableByWindowBackground = true
         panel.standardWindowButton(.closeButton)?.isHidden = true
@@ -20,7 +20,7 @@ private final class RecordingProgressWindowController: NSWindowController {
         panel.standardWindowButton(.zoomButton)?.isHidden = true
 
         let explanation = NSTextField(wrappingLabelWithString:
-            "NiceGrab is applying your background, layout, corner text, and cursor, then encoding the final MP4. Longer recordings can take a few minutes."
+            "NiceGrab applied your background, layout, corner text, and cursor while recording. It is now closing the MP4 and preparing it for the clipboard."
         )
         explanation.textColor = .labelColor
 
@@ -32,9 +32,7 @@ private final class RecordingProgressWindowController: NSWindowController {
         progressIndicator.minValue = 0
         progressIndicator.maxValue = 100
 
-        let note = NSTextField(wrappingLabelWithString:
-            "You can keep using your Mac. The finished video will be copied to the clipboard automatically."
-        )
+        let note = NSTextField(wrappingLabelWithString: "This should only take a moment.")
         note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         note.textColor = .tertiaryLabelColor
 
@@ -72,10 +70,10 @@ private final class RecordingProgressWindowController: NSWindowController {
     func update(progress: Double) {
         let percent = max(0, min(100, progress * 100))
         progressIndicator.doubleValue = percent
-        if percent < 8 {
-            statusLabel.stringValue = "Finalizing the recording…"
+        if percent < 90 {
+            statusLabel.stringValue = "Finishing the last frame…"
         } else if percent < 99 {
-            statusLabel.stringValue = "Compositing and encoding… \(Int(percent.rounded()))%"
+            statusLabel.stringValue = "Closing the MP4…"
         } else {
             statusLabel.stringValue = "Finishing the MP4…"
         }
@@ -443,15 +441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.captureSound?.play()
                         self.showFeedback(symbol: "checkmark", help: "Framed MP4 copied")
                     case .failure(let error):
-                        if let fallbackError = error as? VideoCompositionFallbackError {
-                            self.copyVideoToClipboard(fallbackError.originalURL)
-                            self.showAlert(
-                                fallbackError.localizedDescription,
-                                title: "NiceGrab couldn’t finish the video"
-                            )
-                        } else {
-                            self.recordingFailed(error)
-                        }
+                        self.recordingFailed(error)
                     }
                 }
                 await MainActor.run {
@@ -750,7 +740,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = ""
         statusItem.button?.image = nil
         statusItem.button?.isEnabled = false
-        statusItem.button?.toolTip = "Generating final video…"
+        statusItem.button?.toolTip = "Finishing video…"
 
         guard processingSpinnerTimer == nil else { return }
         updateProcessingSpinner()
@@ -766,7 +756,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateProcessingSpinner() {
         guard let symbol = NSImage(
             systemSymbolName: "arrow.triangle.2.circlepath",
-            accessibilityDescription: "Generating final video"
+            accessibilityDescription: "Finishing video"
         )?.withSymbolConfiguration(.init(pointSize: 14, weight: .regular)) else { return }
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size, flipped: false) { rect in
