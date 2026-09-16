@@ -1,6 +1,13 @@
 import AppKit
 import CoreGraphics
 
+enum CompositionAppearance {
+    static let windowCornerRadius: CGFloat = 12
+    static let shadowOpacity: CGFloat = 0.42
+    static let shadowBlurRadius: CGFloat = 28
+    static let shadowOffsetY: CGFloat = -10
+}
+
 enum CaptureError: LocalizedError {
     case noWindow
     case permissionDenied
@@ -18,7 +25,12 @@ enum CaptureError: LocalizedError {
 }
 
 final class ScreenshotComposer {
-    func captureAndCompose(background: NSImage?, padding: CGFloat, canvas: CanvasOption, cornerText: String) throws -> NSImage {
+    func captureAndCompose(
+        background: NSImage?,
+        padding: CGFloat,
+        canvas: CanvasOption,
+        cornerText: String
+    ) throws -> NSImage {
         guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
             throw CaptureError.permissionDenied
         }
@@ -26,7 +38,13 @@ final class ScreenshotComposer {
         guard let cgImage = CGWindowListCreateImage(.null, .optionIncludingWindow, windowID, [.boundsIgnoreFraming, .bestResolution]) else {
             throw CaptureError.permissionDenied
         }
-        return try compose(window: NSImage(cgImage: cgImage, size: .zero), background: background, padding: padding, canvas: canvas, cornerText: cornerText)
+        return try compose(
+            window: NSImage(cgImage: cgImage, size: .zero),
+            background: background,
+            padding: padding,
+            canvas: canvas,
+            cornerText: cornerText
+        )
     }
 
     func copyToClipboard(_ image: NSImage) throws {
@@ -80,7 +98,13 @@ final class ScreenshotComposer {
         return nil
     }
 
-    private func compose(window: NSImage, background: NSImage?, padding: CGFloat, canvas: CanvasOption, cornerText: String) throws -> NSImage {
+    private func compose(
+        window: NSImage,
+        background: NSImage?,
+        padding: CGFloat,
+        canvas: CanvasOption,
+        cornerText: String
+    ) throws -> NSImage {
         let windowSize = window.size
         let canvasSize = canvas.size(for: windowSize, padding: padding)
         let image = NSImage(size: canvasSize)
@@ -107,12 +131,16 @@ final class ScreenshotComposer {
             width: targetSize.width,
             height: targetSize.height
         )
-        let path = NSBezierPath(roundedRect: target, xRadius: 12, yRadius: 12)
+        let path = NSBezierPath(
+            roundedRect: target,
+            xRadius: CompositionAppearance.windowCornerRadius,
+            yRadius: CompositionAppearance.windowCornerRadius
+        )
         NSGraphicsContext.saveGraphicsState()
         let shadow = NSShadow()
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.42)
-        shadow.shadowBlurRadius = 28
-        shadow.shadowOffset = NSSize(width: 0, height: -10)
+        shadow.shadowColor = NSColor.black.withAlphaComponent(CompositionAppearance.shadowOpacity)
+        shadow.shadowBlurRadius = CompositionAppearance.shadowBlurRadius
+        shadow.shadowOffset = NSSize(width: 0, height: CompositionAppearance.shadowOffsetY)
         shadow.set()
         NSColor.black.setFill()
         path.fill()

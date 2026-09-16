@@ -1,6 +1,87 @@
 import AppKit
 import Carbon
 
+private final class RecordingProgressWindowController: NSWindowController {
+    private let progressIndicator = NSProgressIndicator()
+    private let statusLabel = NSTextField(labelWithString: "Finalizing the recording…")
+
+    init() {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 220),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Preparing Your Video"
+        panel.isReleasedWhenClosed = false
+        panel.isMovableByWindowBackground = true
+        panel.standardWindowButton(.closeButton)?.isHidden = true
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
+
+        let explanation = NSTextField(wrappingLabelWithString:
+            "NiceGrab is applying your background, layout, corner text, and cursor, then encoding the final MP4. Longer recordings can take a few minutes."
+        )
+        explanation.textColor = .labelColor
+
+        statusLabel.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        statusLabel.textColor = .secondaryLabelColor
+
+        progressIndicator.style = .bar
+        progressIndicator.isIndeterminate = false
+        progressIndicator.minValue = 0
+        progressIndicator.maxValue = 100
+
+        let note = NSTextField(wrappingLabelWithString:
+            "You can keep using your Mac. The finished video will be copied to the clipboard automatically."
+        )
+        note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        note.textColor = .tertiaryLabelColor
+
+        let stack = NSStackView(views: [explanation, statusLabel, progressIndicator, note])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let contentView = NSView()
+        panel.contentView = contentView
+        contentView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -24),
+            progressIndicator.widthAnchor.constraint(equalTo: stack.widthAnchor)
+        ])
+
+        super.init(window: panel)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func present() {
+        window?.center()
+        showWindow(nil)
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func update(progress: Double) {
+        let percent = max(0, min(100, progress * 100))
+        progressIndicator.doubleValue = percent
+        if percent < 8 {
+            statusLabel.stringValue = "Finalizing the recording…"
+        } else if percent < 99 {
+            statusLabel.stringValue = "Compositing and encoding… \(Int(percent.rounded()))%"
+        } else {
+            statusLabel.stringValue = "Finishing the MP4…"
+        }
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var hotKey: EventHotKeyRef?
@@ -12,12 +93,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var recordingStartedAt: Date?
     private var processingSpinnerTimer: Timer?
     private var processingSpinnerAngle: CGFloat = 0
+    private var recordingProgressWindow: RecordingProgressWindowController?
     private let composer = ScreenshotComposer()
     private let backgroundStore = BackgroundStore()
     private let shortcutSettings = ShortcutSettings()
     private lazy var proStore = ProStore { [weak self] in self?.rebuildMenu() }
     private var effectiveTemplateText: String {
-        guard proStore.isPro else { return "NiceGrab for macOS" }
+        guard proStore.isPro else { return "Free version of NiceGrab for macOS" }
         return backgroundStore.template == .none ? "" : backgroundStore.templateText
     }
     private var includeMicrophone: Bool {
@@ -42,6 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installHotKeyHandler()
         _ = registerHotKey(shortcutSettings.shortcut)
         _ = registerRecordingHotKey(shortcutSettings.recordingShortcut)
+        showWelcome()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -136,7 +219,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             item.representedObject = option.rawValue
             item.state = backgroundStore.template == option ? .on : .off
-            let savedText = proStore.isPro ? backgroundStore.text(for: option) : "NiceGrab for macOS"
+            item.isEnabled = proStore.isPro
+            let savedText = proStore.isPro ? backgroundStore.text(for: option) : "Free version of NiceGrab for macOS"
             if !savedText.isEmpty {
                 let title = NSMutableAttributedString(
                     string: option.title,
@@ -177,6 +261,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(restore)
         }
 
+        menu.addItem(.separator())
+        let help = NSMenuItem(title: "Help…", action: #selector(showHelp), keyEquivalent: "")
+        help.target = self
+        menu.addItem(help)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit NiceGrab", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
@@ -307,10 +395,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let recorder = videoRecorder as? VideoRecorder, recorder.isRecording {
             showProcessingStatus()
+            showRecordingProgress()
             Task {
                 do { try await recorder.stop() }
                 catch {
                     await MainActor.run {
+                        self.hideRecordingProgress()
                         self.rebuildMenu()
                         self.recordingFailed(error)
                     }
@@ -334,20 +424,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showFeedback(symbol: "record.circle", help: "Recording front window")
         Task {
             do {
-                try await recorder.start(includeMicrophone: useMicrophone, smoothCursor: useSmoothCursor, style: style) { [weak self] result in
+                try await recorder.start(
+                    includeMicrophone: useMicrophone,
+                    smoothCursor: useSmoothCursor,
+                    style: style,
+                    progress: { [weak self] progress in
+                        self?.recordingProgressWindow?.update(progress: progress)
+                    }
+                ) { [weak self] result in
                     guard let self else { return }
                     self.videoRecorder = nil
+                    self.hideRecordingProgress()
                     self.stopRecordingStatus()
                     self.rebuildMenu()
                     switch result {
                     case .success(let url):
-                        let pasteboard = NSPasteboard.general
-                        pasteboard.clearContents()
-                        pasteboard.writeObjects([url as NSURL])
+                        self.copyVideoToClipboard(url)
                         self.captureSound?.play()
                         self.showFeedback(symbol: "checkmark", help: "Framed MP4 copied")
                     case .failure(let error):
-                        self.recordingFailed(error)
+                        if let fallbackError = error as? VideoCompositionFallbackError {
+                            self.copyVideoToClipboard(fallbackError.originalURL)
+                            self.showAlert(
+                                fallbackError.localizedDescription,
+                                title: "NiceGrab couldn’t finish the video"
+                            )
+                        } else {
+                            self.recordingFailed(error)
+                        }
                     }
                 }
                 await MainActor.run {
@@ -359,6 +463,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 await MainActor.run {
                     self.isStartingRecording = false
                     self.videoRecorder = nil
+                    self.hideRecordingProgress()
                     self.stopRecordingStatus()
                     self.rebuildMenu()
                     self.recordingFailed(error)
@@ -373,6 +478,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             showAlert(error.localizedDescription)
         }
+    }
+
+    private func copyVideoToClipboard(_ url: URL) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects([url as NSURL])
+    }
+
+    private func showRecordingProgress() {
+        let controller = RecordingProgressWindowController()
+        recordingProgressWindow = controller
+        controller.present()
+    }
+
+    private func hideRecordingProgress() {
+        recordingProgressWindow?.close()
+        recordingProgressWindow = nil
+    }
+
+    @objc private func showHelp() {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Development"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "—"
+        let email = "laurent@appblit.com"
+        let screenshotShortcut = shortcutSettings.shortcut.displayName
+        let recordingShortcut = shortcutSettings.recordingShortcut.displayName
+
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "NiceGrab Help"
+        alert.informativeText = """
+        NiceGrab turns ordinary app windows into polished, share-ready screenshots and videos.
+
+        What you can do:
+        • Capture or record the frontmost window.
+        • Add a background, padding, aspect ratio, and corner text.
+        • Record system audio and optional microphone audio.
+        • Enable Smooth Cursor for cleaner, fluid pointer movement in recordings.
+        • Paste the finished image or MP4 directly into messages, documents, and presentations.
+
+        Bring the window you want to share to the front, then click the NiceGrab icon in the menu bar. You can also press \(screenshotShortcut) for a screenshot or \(recordingShortcut) to start and stop a recording.
+
+        Your media is processed locally on this Mac and is never uploaded by NiceGrab.
+
+        Version \(version) (build \(build))
+        Questions, problems, or feedback? \(email)
+        """
+        alert.alertStyle = .informational
+        alert.icon = NSApp.applicationIconImage
+        alert.addButton(withTitle: "Email Support")
+        alert.addButton(withTitle: "Close")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        var components = URLComponents()
+        components.scheme = "mailto"
+        components.path = email
+        components.queryItems = [
+            URLQueryItem(name: "subject", value: "NiceGrab \(version) (\(build)) feedback")
+        ]
+        if let url = components.url {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func showWelcome() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Welcome to NiceGrab"
+        alert.informativeText = """
+        Look for the NiceGrab window icon in the menu bar at the top of your screen. Click it to choose a background, adjust the design, capture the front window, or start a recording.
+
+        Bring any window to the front, then use the menu-bar icon—or press \(shortcutSettings.shortcut.displayName) for a screenshot and \(shortcutSettings.recordingShortcut.displayName) to start and stop a recording.
+        """
+        alert.alertStyle = .informational
+        alert.icon = NSApp.applicationIconImage
+        alert.addButton(withTitle: "Get Started")
+        alert.runModal()
     }
 
     @objc private func captureFrontWindow() {
@@ -426,6 +607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func selectTemplate(_ sender: NSMenuItem) {
+        guard proStore.isPro else { return }
         guard let raw = sender.representedObject as? String, let template = TemplateOption(rawValue: raw) else { return }
         backgroundStore.template = template
         if let canvas = template.preferredCanvas { backgroundStore.canvas = canvas }
@@ -434,7 +616,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func editTemplateText() {
         guard proStore.isPro else {
-            purchasePro()
+            showWatermarkUpgradePrompt()
             return
         }
         guard backgroundStore.template != .none else { return }
@@ -452,6 +634,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if alert.runModal() == .alertFirstButtonReturn {
             backgroundStore.templateText = field.stringValue
         }
+    }
+
+    private func showWatermarkUpgradePrompt() {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Upgrade to NiceGrab Pro"
+        alert.informativeText = "Upgrade to remove the NiceGrab watermark and unlock custom corner text for Work, X / Twitter, LinkedIn, and Presentation exports."
+        alert.addButton(withTitle: "Upgrade")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        purchasePro()
     }
 
     @objc private func purchasePro() {

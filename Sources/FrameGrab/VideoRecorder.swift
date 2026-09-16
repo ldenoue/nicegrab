@@ -32,6 +32,15 @@ enum VideoRecordingError: LocalizedError {
     }
 }
 
+struct VideoCompositionFallbackError: LocalizedError {
+    let originalURL: URL
+    let underlyingError: Error
+
+    var errorDescription: String? {
+        "NiceGrab couldn’t apply the final design: \(underlyingError.localizedDescription)\n\nThe original, unstyled recording was preserved and copied to the clipboard."
+    }
+}
+
 struct VideoCompositionStyle {
     let background: NSImage?
     let padding: CGFloat
@@ -86,6 +95,9 @@ private final class MP4WritingContext: @unchecked Sendable {
     let videoInput: AVAssetWriterInput
     let audioOutput: AVAssetReaderAudioMixOutput?
     let audioInput: AVAssetWriterInput?
+    let progressHandler: (Double) -> Void
+    private let progressLock = NSLock()
+    private var lastProgressStep = -1
 
     init(
         reader: AVAssetReader,
@@ -93,7 +105,8 @@ private final class MP4WritingContext: @unchecked Sendable {
         videoOutput: AVAssetReaderVideoCompositionOutput,
         videoInput: AVAssetWriterInput,
         audioOutput: AVAssetReaderAudioMixOutput?,
-        audioInput: AVAssetWriterInput?
+        audioInput: AVAssetWriterInput?,
+        progressHandler: @escaping (Double) -> Void
     ) {
         self.reader = reader
         self.writer = writer
@@ -101,6 +114,15 @@ private final class MP4WritingContext: @unchecked Sendable {
         self.videoInput = videoInput
         self.audioOutput = audioOutput
         self.audioInput = audioInput
+        self.progressHandler = progressHandler
+    }
+
+    func claimProgressStep(_ step: Int) -> Bool {
+        progressLock.lock()
+        defer { progressLock.unlock() }
+        guard step > lastProgressStep else { return false }
+        lastProgressStep = step
+        return true
     }
 }
 
@@ -147,7 +169,9 @@ private struct OneEuroFilter {
 
 @available(macOS 14.0, *)
 private final class CursorTracker {
-    private let windowFrame: CGRect
+    private let windowID: CGWindowID
+    private var windowFrame: CGRect
+    private var lastWindowFrameRefresh: TimeInterval = 0
     private var displayLink: CADisplayLink?
     private var globalMonitor: Any?
     private var localMonitor: Any?
@@ -157,7 +181,8 @@ private final class CursorTracker {
     private var xFilter = OneEuroFilter(minimumCutoff: 1, beta: 0.001, derivativeCutoff: 0.8)
     private var yFilter = OneEuroFilter(minimumCutoff: 1, beta: 0.001, derivativeCutoff: 0.8)
 
-    init(windowFrame: CGRect) {
+    init(windowID: CGWindowID, windowFrame: CGRect) {
+        self.windowID = windowID
         self.windowFrame = windowFrame
     }
 
@@ -204,9 +229,10 @@ private final class CursorTracker {
     }
 
     private func recordSample() {
+        let now = ProcessInfo.processInfo.systemUptime
+        refreshWindowFrame(at: now)
         guard windowFrame.width > 0, windowFrame.height > 0 else { return }
         let point = latestPoint
-        let now = ProcessInfo.processInfo.systemUptime
         let localX = point.x - windowFrame.minX
         let localY = point.y - windowFrame.minY
         let sample = CursorSample(
@@ -220,11 +246,26 @@ private final class CursorTracker {
         )
         samples.append(sample)
     }
+
+    private func refreshWindowFrame(at time: TimeInterval) {
+        guard time - lastWindowFrameRefresh >= 1.0 / 30.0 else { return }
+        lastWindowFrameRefresh = time
+        guard let windows = CGWindowListCopyWindowInfo(.optionIncludingWindow, windowID) as? [[String: Any]],
+              let bounds = windows.first?[kCGWindowBounds as String] as? [String: Any],
+              let x = bounds["X"] as? CGFloat,
+              let y = bounds["Y"] as? CGFloat,
+              let width = bounds["Width"] as? CGFloat,
+              let height = bounds["Height"] as? CGFloat,
+              width > 0,
+              height > 0 else { return }
+        windowFrame = CGRect(x: x, y: y, width: width, height: height)
+    }
 }
 
 @available(macOS 15.0, *)
 final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate, SCStreamOutput {
     typealias Completion = (Result<URL, Error>) -> Void
+    typealias ProgressHandler = @MainActor (Double) -> Void
 
     private let ownPID = ProcessInfo.processInfo.processIdentifier
     private var stream: SCStream?
@@ -233,6 +274,7 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
     private var finalURL: URL?
     private var style: VideoCompositionStyle?
     private var completion: Completion?
+    private var progressHandler: ProgressHandler?
     private var isStopping = false
     private var cursorTracker: CursorTracker?
     private var cursorSamples: [CursorSample] = []
@@ -247,7 +289,13 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
     var isRecording: Bool { stream != nil }
     var isFinishing: Bool { isStopping }
 
-    func start(includeMicrophone: Bool, smoothCursor: Bool, style: VideoCompositionStyle, completion: @escaping Completion) async throws {
+    func start(
+        includeMicrophone: Bool,
+        smoothCursor: Bool,
+        style: VideoCompositionStyle,
+        progress: @escaping ProgressHandler,
+        completion: @escaping Completion
+    ) async throws {
         guard !isRecording else { return }
         if includeMicrophone {
             let microphoneAllowed: Bool
@@ -274,8 +322,12 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         let configuration = SCStreamConfiguration()
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         cursorCaptureScale = scale
-        configuration.width = max(2, Int(window.frame.width * scale))
-        configuration.height = max(2, Int(window.frame.height * scale))
+        // SCRecordingOutput encodes H.264 using 4:2:0 chroma subsampling, which
+        // requires even pixel dimensions. Window frames can contain half-point
+        // sizes, so their scaled pixel dimensions are occasionally odd.
+        configuration.width = evenPixelDimension(window.frame.width * scale)
+        configuration.height = evenPixelDimension(window.frame.height * scale)
+        // Preserve fluid pointer and window motion at 60 fps.
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
         configuration.queueDepth = 6
         configuration.showsCursor = !smoothCursor
@@ -312,11 +364,12 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         self.rawURL = urls.raw
         self.finalURL = urls.final
         self.style = style
+        self.progressHandler = progress
         self.completion = completion
         self.isStopping = false
 
         if smoothCursor {
-            let tracker = CursorTracker(windowFrame: window.frame)
+            let tracker = CursorTracker(windowID: window.windowID, windowFrame: window.frame)
             cursorTracker = tracker
             tracker.start()
         }
@@ -332,6 +385,7 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
     func stop() async throws {
         guard let stream, !isStopping else { return }
         isStopping = true
+        reportProgress(0.02)
         cursorSamples = cursorTracker?.stop() ?? []
         cursorTracker = nil
         try await stream.stopCapture()
@@ -360,11 +414,13 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
             finish(.failure(VideoRecordingError.couldNotProcess))
             return
         }
+        reportProgress(0.05)
         Task {
             do {
                 let samples = cursorTracker?.stop() ?? cursorSamples
                 cursorTracker = nil
                 let videoTimedSamples = cursorSamplesOnVideoTimeline(samples)
+                reportProgress(0.08)
                 try await compositeRecording(
                     from: rawURL,
                     to: finalURL,
@@ -375,7 +431,11 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
                 try? FileManager.default.removeItem(at: rawURL)
                 finish(.success(finalURL), removeFiles: false)
             } catch {
-                finish(.failure(error))
+                let fallbackURL = preserveOriginalRecording(from: rawURL, at: finalURL)
+                finish(.failure(VideoCompositionFallbackError(
+                    originalURL: fallbackURL,
+                    underlyingError: error
+                )), removeFiles: false)
             }
         }
     }
@@ -402,6 +462,7 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         finalURL = nil
         style = nil
         completion = nil
+        progressHandler = nil
         isStopping = false
         cursorTracker?.stop()
         cursorTracker = nil
@@ -411,6 +472,24 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         firstFramePTS = nil
         minimumHostMinusPTS = nil
         frameTimingLock.unlock()
+    }
+
+    private func reportProgress(_ progress: Double) {
+        guard let progressHandler else { return }
+        let clampedProgress = max(0, min(1, progress))
+        Task { @MainActor in
+            progressHandler(clampedProgress)
+        }
+    }
+
+    private func preserveOriginalRecording(from rawURL: URL, at preferredURL: URL) -> URL {
+        try? FileManager.default.removeItem(at: preferredURL)
+        do {
+            try FileManager.default.moveItem(at: rawURL, to: preferredURL)
+            return preferredURL
+        } catch {
+            return rawURL
+        }
     }
 
     private func cursorSamplesOnVideoTimeline(_ samples: [CursorSample]) -> [CursorSample] {
@@ -451,6 +530,11 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         return nil
     }
 
+    private func evenPixelDimension(_ value: CGFloat) -> Int {
+        let roundedUp = max(2, Int(ceil(value)))
+        return roundedUp + roundedUp % 2
+    }
+
     private func recordingURLs() throws -> (raw: URL, final: URL) {
         let root = try FileManager.default.url(
             for: .applicationSupportDirectory,
@@ -479,6 +563,7 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw VideoRecordingError.couldNotProcess
         }
+        let duration = try await asset.load(.duration).seconds
         let naturalSize = try await videoTrack.load(.naturalSize)
         let requestedCanvasSize = style.canvas.size(for: naturalSize, padding: style.padding)
         // 4:2:0 H.264 needs even dimensions. Adaptive canvases inherit the
@@ -503,8 +588,13 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
             width: targetSize.width,
             height: targetSize.height
         )
-        let radius = min(14, targetSize.width / 20, targetSize.height / 20)
+        let radius = min(
+            CompositionAppearance.windowCornerRadius,
+            targetSize.width / 20,
+            targetSize.height / 20
+        )
         let mask = makeRoundedMask(rect: targetRect, canvasExtent: canvasExtent, radius: radius)
+        let windowShadow = makeWindowShadow(rect: targetRect, canvasExtent: canvasExtent, radius: radius)
         var cursorImages: [ObjectIdentifier: CursorImage] = [:]
         for sample in cursorSamples {
             guard let cursor = sample.cursor else { continue }
@@ -546,34 +636,7 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
                 kCIInputBackgroundImageKey: transparentCanvas,
                 kCIInputMaskImageKey: mask
             ])
-            let shadowSource = roundedWindow
-                .applyingFilter("CIColorMatrix", parameters: [
-                    "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
-                    "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
-                    "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0),
-                    "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1)
-                ])
-
-            // A broad ambient shadow separates the window from textured backgrounds;
-            // the tighter key shadow matches the screenshot compositing treatment.
-            let ambientShadow = shadowSource
-                .applyingFilter("CIColorMatrix", parameters: [
-                    "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0.30)
-                ])
-                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 54])
-                .transformed(by: CGAffineTransform(translationX: 0, y: -6))
-                .cropped(to: canvasExtent)
-
-            let keyShadow = shadowSource
-                .applyingFilter("CIColorMatrix", parameters: [
-                    "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0.48)
-                ])
-                .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 24])
-                .transformed(by: CGAffineTransform(translationX: 0, y: -12))
-                .cropped(to: canvasExtent)
-
-            let combinedShadow = keyShadow.composited(over: ambientShadow)
-            let framedWithShadow = roundedWindow.composited(over: combinedShadow)
+            let framedWithShadow = roundedWindow.composited(over: windowShadow)
             var result = framedWithShadow.composited(over: background)
             if let overlay { result = overlay.composited(over: result) }
             request.finish(with: result.cropped(to: canvasExtent), context: nil)
@@ -594,6 +657,7 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
             videoTrack: videoTrack,
             videoComposition: composition,
             canvasSize: canvasSize,
+            duration: duration,
             outputURL: outputURL
         )
     }
@@ -603,6 +667,7 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
         videoTrack: AVAssetTrack,
         videoComposition: AVVideoComposition,
         canvasSize: CGSize,
+        duration: TimeInterval,
         outputURL: URL
     ) async throws {
         let reader = try AVAssetReader(asset: asset)
@@ -624,11 +689,12 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
 
         let width = Int(canvasSize.width.rounded())
         let height = Int(canvasSize.height.rounded())
-        // Screen recordings compress well. This targets about 4 Mbps at
-        // 1080p60, scaling with pixel count while retaining crisp UI text.
+        // Screen recordings contain large static regions and compress well.
+        // Target about 1 Mbps at 1080p60, scaling with pixel count while
+        // retaining enough headroom for scrolling and other window motion.
         let bitsPerSecond = min(
-            8_000_000,
-            max(1_000_000, Int(Double(width * height * 60) * 0.032))
+            5_000_000,
+            max(500_000, Int(Double(width * height * 60) * 0.008))
         )
         let videoInput = AVAssetWriterInput(
             mediaType: .video,
@@ -644,7 +710,9 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
                 AVVideoCompressionPropertiesKey: [
                     AVVideoAverageBitRateKey: bitsPerSecond,
                     AVVideoExpectedSourceFrameRateKey: 60,
-                    AVVideoMaxKeyFrameIntervalKey: 120,
+                    AVVideoMaxKeyFrameIntervalDurationKey: 10,
+                    AVVideoAllowFrameReorderingKey: true,
+                    AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,
                     AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
                 ]
             ]
@@ -697,7 +765,10 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
             videoOutput: videoOutput,
             videoInput: videoInput,
             audioOutput: audioOutput,
-            audioInput: audioInput
+            audioInput: audioInput,
+            progressHandler: { [weak self] progress in
+                self?.reportProgress(progress)
+            }
         )
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -716,6 +787,11 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
                         context.videoInput.markAsFinished()
                         group.leave()
                         return
+                    }
+                    let timelineProgress = sample.presentationTimeStamp.seconds / max(0.001, duration)
+                    let progress = 0.08 + max(0, min(1, timelineProgress)) * 0.88
+                    if context.claimProgressStep(Int(progress * 100)) {
+                        context.progressHandler(progress)
                     }
                 }
             }
@@ -748,6 +824,7 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
             group.notify(queue: DispatchQueue.global(qos: .userInitiated)) {
                 context.writer.finishWriting {
                     if context.writer.status == .completed {
+                        context.progressHandler(1)
                         continuation.resume()
                     } else {
                         continuation.resume(
@@ -811,6 +888,46 @@ final class VideoRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate
             return CIImage(color: .white).cropped(to: rect).composited(over: clear)
         }
         return rounded.composited(over: clear).cropped(to: canvasExtent)
+    }
+
+    private func makeWindowShadow(rect: CGRect, canvasExtent: CGRect, radius: CGFloat) -> CIImage {
+        let pixelWidth = max(1, Int(canvasExtent.width.rounded(.up)))
+        let pixelHeight = max(1, Int(canvasExtent.height.rounded(.up)))
+        guard let context = CGContext(
+            data: nil,
+            width: pixelWidth,
+            height: pixelHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return CIImage(color: .clear).cropped(to: canvasExtent)
+        }
+        context.setShadow(
+            offset: CGSize(width: 0, height: CompositionAppearance.shadowOffsetY),
+            blur: CompositionAppearance.shadowBlurRadius,
+            color: CGColor(gray: 0, alpha: CompositionAppearance.shadowOpacity)
+        )
+        let windowPath = CGPath(
+            roundedRect: rect,
+            cornerWidth: radius,
+            cornerHeight: radius,
+            transform: nil
+        )
+        context.setFillColor(CGColor(gray: 0, alpha: 1))
+        context.addPath(windowPath)
+        context.fillPath()
+        // Keep only the shadow outside the window. A solid backing shape can
+        // show through semitransparent capture-edge pixels as a dark band.
+        context.setShadow(offset: .zero, blur: 0, color: nil)
+        context.setBlendMode(.clear)
+        context.addPath(windowPath)
+        context.fillPath()
+        guard let image = context.makeImage() else {
+            return CIImage(color: .clear).cropped(to: canvasExtent)
+        }
+        return CIImage(cgImage: image).cropped(to: canvasExtent)
     }
 
     private func makeBackground(_ image: NSImage?, extent: CGRect) -> CIImage {

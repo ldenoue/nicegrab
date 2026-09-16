@@ -70,13 +70,16 @@ enum TemplateOption: String, CaseIterable {
 final class BackgroundStore {
     private let defaults = UserDefaults.standard
     private let bookmarkKey = "backgroundBookmark"
+    private let storedFileKey = "backgroundStoredFile"
     private let nameKey = "backgroundName"
     private let paddingKey = "padding"
     private let canvasKey = "canvas"
     private let templateKey = "template"
 
     var displayName: String? { defaults.string(forKey: nameKey) }
-    var hasCustomBackground: Bool { defaults.data(forKey: bookmarkKey) != nil }
+    var hasCustomBackground: Bool {
+        defaults.string(forKey: storedFileKey) != nil || defaults.data(forKey: bookmarkKey) != nil
+    }
 
     var padding: PaddingOption {
         get { PaddingOption(rawValue: defaults.string(forKey: paddingKey) ?? "comfortable") ?? .comfortable }
@@ -107,6 +110,9 @@ final class BackgroundStore {
     }
 
     var image: NSImage? {
+        if let url = storedBackgroundURL(), let image = NSImage(contentsOf: url) {
+            return image
+        }
         guard let data = defaults.data(forKey: bookmarkKey) else { return nil }
         var stale = false
         guard let url = try? URL(resolvingBookmarkData: data, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale) else { return nil }
@@ -116,14 +122,53 @@ final class BackgroundStore {
     }
 
     func setBackground(from url: URL) throws {
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
         guard NSImage(contentsOf: url) != nil else { throw CocoaError(.fileReadCorruptFile) }
-        let data = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
-        defaults.set(data, forKey: bookmarkKey)
+
+        let directory = try backgroundDirectory()
+        let pathExtension = url.pathExtension.isEmpty ? "image" : url.pathExtension.lowercased()
+        let storedName = "Background-\(UUID().uuidString).\(pathExtension)"
+        let destination = directory.appendingPathComponent(storedName)
+        let previousURL = storedBackgroundURL()
+        let data = try Data(contentsOf: url)
+        try data.write(to: destination, options: .atomic)
+        guard NSImage(contentsOf: destination) != nil else {
+            try? FileManager.default.removeItem(at: destination)
+            throw CocoaError(.fileReadCorruptFile)
+        }
+
+        defaults.set(storedName, forKey: storedFileKey)
         defaults.set(url.lastPathComponent, forKey: nameKey)
+        defaults.removeObject(forKey: bookmarkKey)
+        if let previousURL, previousURL != destination {
+            try? FileManager.default.removeItem(at: previousURL)
+        }
     }
 
     func clearBackground() {
+        if let url = storedBackgroundURL() {
+            try? FileManager.default.removeItem(at: url)
+        }
         defaults.removeObject(forKey: bookmarkKey)
+        defaults.removeObject(forKey: storedFileKey)
         defaults.removeObject(forKey: nameKey)
+    }
+
+    private func backgroundDirectory() throws -> URL {
+        let root = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ).appendingPathComponent("NiceGrab/Backgrounds", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    private func storedBackgroundURL() -> URL? {
+        guard let storedName = defaults.string(forKey: storedFileKey),
+              let directory = try? backgroundDirectory() else { return nil }
+        return directory.appendingPathComponent(storedName)
     }
 }
