@@ -80,8 +80,78 @@ private final class RecordingProgressWindowController: NSWindowController {
     }
 }
 
+private final class StatusItemBackgroundDropView: NSView {
+    var onDrop: ((URL) -> Bool)?
+    private var isDragActive = false
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard isDragActive else { return }
+        let highlight = bounds.insetBy(dx: 2, dy: 2)
+        NSColor.controlAccentColor.withAlphaComponent(0.28).setFill()
+        NSBezierPath(roundedRect: highlight, xRadius: 5, yRadius: 5).fill()
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard imageURL(from: sender) != nil else { return [] }
+        isDragActive = true
+        needsDisplay = true
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        imageURL(from: sender) == nil ? [] : .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        clearDragHighlight()
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        defer { clearDragHighlight() }
+        guard let url = imageURL(from: sender) else { return false }
+        return onDrop?(url) ?? false
+    }
+
+    // Keep the status item's ordinary click/menu behavior despite this view
+    // sitting above its button as the registered drag destination.
+    override func mouseDown(with event: NSEvent) {
+        superview?.mouseDown(with: event)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        superview?.rightMouseDown(with: event)
+    }
+
+    private func imageURL(from sender: NSDraggingInfo) -> URL? {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        guard let value = sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: options
+        )?.first as? NSURL else { return nil }
+        let url = value as URL
+        guard NSImage(contentsOf: url) != nil else { return nil }
+        return url
+    }
+
+    private func clearDragHighlight() {
+        isDragActive = false
+        needsDisplay = true
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
+    private var backgroundDropView: StatusItemBackgroundDropView?
     private var hotKey: EventHotKeyRef?
     private var recordingHotKey: EventHotKeyRef?
     private var hotKeyHandler: EventHandlerRef?
@@ -135,7 +205,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func makeStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "NiceGrab")
+        guard let button = statusItem.button else { return }
+        button.image = NSImage(systemSymbolName: "macwindow.on.rectangle", accessibilityDescription: "NiceGrab")
+        button.toolTip = "NiceGrab — drop an image here to change the background"
+        let dropView = StatusItemBackgroundDropView(frame: button.bounds)
+        dropView.autoresizingMask = [.width, .height]
+        dropView.onDrop = { [weak self] url in
+            self?.useDroppedBackground(url) ?? false
+        }
+        button.addSubview(dropView)
+        backgroundDropView = dropView
         rebuildMenu()
     }
 
@@ -576,6 +655,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rebuildMenu()
         } catch {
             showAlert("Could not use that image: \(error.localizedDescription)")
+        }
+    }
+
+    private func useDroppedBackground(_ url: URL) -> Bool {
+        guard !isProcessingRecording else { return false }
+        do {
+            try backgroundStore.setBackground(from: url)
+            rebuildMenu()
+            showFeedback(symbol: "photo.fill", help: "Background changed")
+            return true
+        } catch {
+            showAlert("Could not use that image: \(error.localizedDescription)")
+            return false
         }
     }
 
