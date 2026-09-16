@@ -486,9 +486,13 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
         writer.shouldOptimizeForNetworkUse = true
         let width = Int(canvasSize.width.rounded())
         let height = Int(canvasSize.height.rounded())
+        // VideoToolbox treats average bitrate as a ceiling for easy, mostly
+        // static screen content. Give the opening intra-frame enough room to
+        // preserve text and window edges; the encoder can still emit far fewer
+        // bits after the scene settles.
         let bitsPerSecond = min(
-            5_000_000,
-            max(500_000, Int(Double(width * height * 60) * 0.008))
+            10_000_000,
+            max(2_000_000, Int(Double(width * height * 60) * 0.032))
         )
         let videoInput = AVAssetWriterInput(
             mediaType: .video,
@@ -504,7 +508,7 @@ final class VideoRecorder: NSObject, SCStreamDelegate, SCStreamOutput {
                 AVVideoCompressionPropertiesKey: [
                     AVVideoAverageBitRateKey: bitsPerSecond,
                     AVVideoExpectedSourceFrameRateKey: 60,
-                    AVVideoMaxKeyFrameIntervalDurationKey: 10,
+                    AVVideoMaxKeyFrameIntervalDurationKey: 2,
                     AVVideoAllowFrameReorderingKey: true,
                     AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,
                     AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
