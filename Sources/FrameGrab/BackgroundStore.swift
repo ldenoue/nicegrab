@@ -68,6 +68,13 @@ enum TemplateOption: String, CaseIterable {
 }
 
 final class BackgroundStore {
+    private static let defaultBackgroundImage: NSImage? = {
+        guard let url = Bundle.main.url(forResource: "DefaultBackground", withExtension: "jpg") else {
+            return nil
+        }
+        return NSImage(contentsOf: url)
+    }()
+
     private let defaults = UserDefaults.standard
     private let bookmarkKey = "backgroundBookmark"
     private let storedFileKey = "backgroundStoredFile"
@@ -113,12 +120,22 @@ final class BackgroundStore {
         if let url = storedBackgroundURL(), let image = NSImage(contentsOf: url) {
             return image
         }
-        guard let data = defaults.data(forKey: bookmarkKey) else { return nil }
-        var stale = false
-        guard let url = try? URL(resolvingBookmarkData: data, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale) else { return nil }
-        let accessing = url.startAccessingSecurityScopedResource()
-        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
-        return NSImage(contentsOf: url)
+        if let data = defaults.data(forKey: bookmarkKey) {
+            var stale = false
+            if let url = try? URL(
+                resolvingBookmarkData: data,
+                options: [.withSecurityScope],
+                relativeTo: nil,
+                bookmarkDataIsStale: &stale
+            ) {
+                let accessing = url.startAccessingSecurityScopedResource()
+                defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+                if let image = NSImage(contentsOf: url) {
+                    return image
+                }
+            }
+        }
+        return Self.defaultBackgroundImage
     }
 
     func setBackground(from url: URL) throws {

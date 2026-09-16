@@ -174,10 +174,8 @@ private final class BackgroundPreviewView: NSView {
         if let backgroundImage {
             drawAspectFill(backgroundImage, in: previewRect)
         } else {
-            NSGradient(colors: [
-                NSColor(calibratedRed: 0.18, green: 0.12, blue: 0.42, alpha: 1),
-                NSColor(calibratedRed: 0.91, green: 0.35, blue: 0.46, alpha: 1)
-            ])?.draw(in: previewRect, angle: -35)
+            NSColor.windowBackgroundColor.setFill()
+            previewRect.fill()
         }
         NSGraphicsContext.restoreGraphicsState()
 
@@ -308,11 +306,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(cursor)
         menu.addItem(.separator())
 
-        let backgroundTitle = backgroundStore.displayName.map { "Background: \($0)" } ?? "Background: Default Gradient"
-        let current = NSMenuItem(title: backgroundTitle, action: nil, keyEquivalent: "")
-        current.isEnabled = false
-        menu.addItem(current)
-
         let preview = NSMenuItem()
         preview.view = BackgroundPreviewView(image: backgroundStore.image)
         menu.addItem(preview)
@@ -322,7 +315,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(choose)
 
         if backgroundStore.hasCustomBackground {
-            let clear = NSMenuItem(title: "Use Default Gradient", action: #selector(clearBackground), keyEquivalent: "")
+            let clear = NSMenuItem(title: "Use Default Background", action: #selector(clearBackground), keyEquivalent: "")
             clear.target = self
             menu.addItem(clear)
         }

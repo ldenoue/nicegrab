@@ -20,7 +20,7 @@ The App Store link will become available as soon as Apple publishes the app.
 - Optionally includes microphone audio in recordings
 - Composites recordings over the same background, canvas, and template as screenshots
 - Saves the finished MP4 locally and copies its file to the clipboard
-- Uses any image as the background, or a built-in purple-to-coral gradient
+- Uses the bundled illustrated background by default and supports any custom background image
 - Produces adaptive, 16:9, 4:3, or square output
 - Offers compact, comfortable, and spacious canvas padding
 - Includes Work, X/Twitter, LinkedIn, and Presentation templates
