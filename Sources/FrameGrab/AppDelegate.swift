@@ -149,6 +149,64 @@ private final class StatusItemBackgroundDropView: NSView {
     }
 }
 
+private final class BackgroundPreviewView: NSView {
+    private let backgroundImage: NSImage?
+
+    init(image: NSImage?) {
+        backgroundImage = image
+        super.init(frame: NSRect(x: 0, y: 0, width: 220, height: 82))
+        setAccessibilityElement(true)
+        setAccessibilityRole(.image)
+        setAccessibilityLabel("Current background preview")
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let previewRect = bounds.insetBy(dx: 12, dy: 6)
+        let clipPath = NSBezierPath(roundedRect: previewRect, xRadius: 7, yRadius: 7)
+
+        NSGraphicsContext.saveGraphicsState()
+        clipPath.addClip()
+        if let backgroundImage {
+            drawAspectFill(backgroundImage, in: previewRect)
+        } else {
+            NSGradient(colors: [
+                NSColor(calibratedRed: 0.18, green: 0.12, blue: 0.42, alpha: 1),
+                NSColor(calibratedRed: 0.91, green: 0.35, blue: 0.46, alpha: 1)
+            ])?.draw(in: previewRect, angle: -35)
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        NSColor.separatorColor.withAlphaComponent(0.7).setStroke()
+        clipPath.lineWidth = 1
+        clipPath.stroke()
+    }
+
+    private func drawAspectFill(_ image: NSImage, in rect: NSRect) {
+        guard image.size.width > 0, image.size.height > 0 else { return }
+        let scale = max(rect.width / image.size.width, rect.height / image.size.height)
+        let size = NSSize(width: image.size.width * scale, height: image.size.height * scale)
+        let target = NSRect(
+            x: rect.midX - size.width / 2,
+            y: rect.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
+        image.draw(
+            in: target,
+            from: .zero,
+            operation: .copy,
+            fraction: 1,
+            respectFlipped: true,
+            hints: [.interpolation: NSImageInterpolation.high]
+        )
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var backgroundDropView: StatusItemBackgroundDropView?
@@ -254,6 +312,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let current = NSMenuItem(title: backgroundTitle, action: nil, keyEquivalent: "")
         current.isEnabled = false
         menu.addItem(current)
+
+        let preview = NSMenuItem()
+        preview.view = BackgroundPreviewView(image: backgroundStore.image)
+        menu.addItem(preview)
 
         let choose = NSMenuItem(title: "Choose Background Image…", action: #selector(chooseBackground), keyEquivalent: "")
         choose.target = self
